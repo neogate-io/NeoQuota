@@ -21,6 +21,7 @@ dist/quota-monitor.html
 
 ```bash
 export MONITOR_KEY="监控页登录密码"
+export HOST=127.0.0.1
 export CPA_API_BASE="http://154.21.88.164:8398"
 export CPA_MANAGEMENT_KEY="CPA management key"
 export PORT=8787
@@ -52,10 +53,13 @@ export ALIYUN_SMS_TEMPLATE_CODE="SMS_xxx"
 bun run server
 ```
 
+`HOST` 是监控服务监听地址，默认推荐 `127.0.0.1` 配合反向代理；如果要让局域网、容器或其他机器直接访问，可以在 `.env` 或启动环境里设置 `HOST=0.0.0.0`。
+
 多 CPA：
 
 ```bash
 export MONITOR_KEY="监控页登录密码"
+export HOST=127.0.0.1
 export CPA_TARGETS='[
   {"id":"main","name":"Main CPA","apiBase":"http://154.21.88.164:8398","managementKey":"key-a"},
   {"id":"backup","name":"Backup CPA","apiBase":"http://127.0.0.1:8398","managementKey":"key-b"}

@@ -31,6 +31,7 @@ export interface SmsAlertConfig {
 }
 
 export interface ServerConfig {
+  host: string;
   port: number;
   dbPath: string;
   monitorKey: string;
@@ -227,6 +228,7 @@ export function loadConfig(): ServerConfig {
   if (!monitorKey) throw new Error('Set MONITOR_KEY');
 
   return {
+    host: readEnv('HOST') || '127.0.0.1',
     port: parseNumberEnv('PORT', 8787),
     dbPath: readEnv('DB_PATH') || './data/quota-monitor.sqlite',
     monitorKey,

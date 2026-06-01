@@ -176,11 +176,12 @@ async function handleRequest(request: Request): Promise<Response> {
 collector.start();
 
 const server = Bun.serve({
+  hostname: config.host,
   port: config.port,
   fetch: handleRequest,
 });
 
-console.info(`Quota monitor server listening on http://127.0.0.1:${server.port}`);
+console.info(`Quota monitor server listening on ${String(server.url).replace(/\/$/, '')}`);
 console.info(`Configured CPA targets: ${config.targets.map((target) => `${target.name}(${target.id})`).join(', ')}`);
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
