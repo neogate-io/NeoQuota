@@ -35,6 +35,7 @@ export interface QuotaWindowState {
   usedPercent: number | null;
   remainingPoints: number | null;
   remainingUsd: number | null;
+  fullUsd: number | null;
   resetAtMs: number | null;
   priced: boolean;
 }
@@ -46,6 +47,8 @@ export interface AccountQuotaRow {
   name: string;
   provider: string;
   authIndex: string | null;
+  authFileName?: string | null;
+  authId?: string | null;
   accountId: string | null;
   disabled: boolean;
   status: AccountQuotaStatus;
@@ -59,6 +62,7 @@ export interface AccountQuotaRow {
   quotaSampledAt: number | null;
   quotaAgeMs: number | null;
   backoffUntil: number | null;
+  requestHeaderSource: 'default' | 'cpa-metadata' | string | null;
   error: string | null;
 }
 
@@ -170,6 +174,82 @@ export interface CapacityCurvePoint {
   projectedUsd: number;
   consumedUsd: number;
   refreshedUsd: number;
+  fiveHourUsd: number;
+  weeklyUsd: number;
+  usableUsd: number;
+  refreshedFiveHourUsd: number;
+  refreshedWeeklyUsd: number;
+}
+
+export type CapacityStatus = 'ready' | 'tight' | 'untrusted' | 'updating' | 'collecting' | 'waiting';
+export type CapacitySupportStatus = 'insufficient-sample' | 'idle' | 'within-5h' | 'beyond-5h';
+
+export interface CapacityTimelinePoint {
+  offsetMinutes: number;
+  at: number;
+  usableUsd: number;
+  projectedSpendUsd: number | null;
+  projectedRemainingUsd: number | null;
+  fiveHourUsd: number;
+  weeklyUsd: number;
+}
+
+export interface CapacityReleaseEvent {
+  at: number;
+  releasedUsd: number;
+  usableUsd: number;
+}
+
+export interface TwentyFourHourCapacitySummary {
+  horizonHours: number;
+  projectedAddedUsableUsd: number | null;
+  lowestUsableUsd: number | null;
+  lowestAt: number | null;
+  nextMajorReleaseAt: number | null;
+  nextMajorReleaseUsd: number | null;
+  releaseEvents: CapacityReleaseEvent[];
+}
+
+export interface CapacitySummary {
+  snapshotCapturedAt: number | null;
+  snapshotAgeMs: number | null;
+  freshComplete: boolean;
+  enabledAccounts: number;
+  includedAccounts: number;
+  excludedAccounts: number;
+  currentUsableUsd: number | null;
+  hourlyBurnUsd: number | null;
+  observedHourlyBurnUsd: number | null;
+  effectiveHourlyBurnUsd: number | null;
+  burnCoverageMultiplier: number | null;
+  burnRateBasis: 'three-hour' | 'one-hour' | 'thirty-minute-spike' | 'zero' | 'insufficient';
+  consumptionCoveragePercent: number;
+  supportHours: number | null;
+  estimatedDepletionAt: number | null;
+  supportStatus: CapacitySupportStatus;
+  projectedFiveHourSpendUsd: number | null;
+  projectedFiveHourMarginUsd: number | null;
+  fiveHourTimeline: CapacityTimelinePoint[];
+  twentyFourHourSummary: TwentyFourHourCapacitySummary;
+  status: CapacityStatus;
+}
+
+export interface SimulationExcludedAccounts {
+  disabled: number;
+  inactive: number;
+  staleCached: number;
+  unpriced: number;
+  missingQuota: number;
+  untrustedSource: number;
+}
+
+export interface FutureFiveHourSummary {
+  horizonHours: number;
+  projectedUsableUsd: number;
+  projectedSpendUsd: number | null;
+  projectedMarginUsd: number | null;
+  coverageRatio: number | null;
+  status: 'insufficient-sample' | 'idle' | 'enough' | 'shortfall';
 }
 
 export interface RiskSummary {
@@ -180,15 +260,20 @@ export interface RiskSummary {
   nominalFiveHourUsd: number;
   conservativeWeeklyUsd: number;
   nominalWeeklyUsd: number;
+  conservativeUsableUsd: number;
+  nominalUsableUsd: number;
   hourlyBurnUsd: number | null;
   oneHourBurnUsd: number | null;
   threeHourBurnUsd: number | null;
   thirtyMinuteBurnUsd: number | null;
   burnRateBasis: 'three-hour' | 'one-hour' | 'thirty-minute-spike' | 'zero' | 'insufficient';
   availableHours: number | null;
+  availableHoursCapped: boolean;
   estimatedDepletionAt: number | null;
   projectedFiveHourSpendUsd: number;
+  futureFiveHour: FutureFiveHourSummary;
   futureFiveHourRefreshUsd: number;
+  futureWeeklyRefreshUsd: number;
   lowestProjectedFiveHourUsd: number | null;
   lowestProjectedAt: number | null;
   consumptionCoveragePercent: number;
@@ -197,6 +282,7 @@ export interface RiskSummary {
   trustedCachedAccounts: number;
   staleCachedAccounts: number;
   excludedAccounts: number;
+  simulationExcludedAccounts: SimulationExcludedAccounts;
   freshCoveragePercent: number;
   trustedCoveragePercent: number;
   cacheTrustMaxMinutes: number;
@@ -210,6 +296,7 @@ export interface LatestPayload {
   accounts: AccountQuotaRow[];
   refreshBuckets: RefreshBucket[];
   consumption: ConsumptionSummary;
+  capacity: CapacitySummary;
   prediction: PredictionSummary;
   risk: RiskSummary;
   pricingProfile: PricingProfile;

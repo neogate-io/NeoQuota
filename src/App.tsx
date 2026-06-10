@@ -1,55 +1,109 @@
 import {
-  Activity,
   AlertTriangle,
-  BarChart3,
-  CalendarClock,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronUp,
+  Calculator,
+  CheckCircle2,
   Clock,
-  Database,
-  Gauge,
-  KeyRound,
   LayoutDashboard,
   ListChecks,
-  LogIn,
   Play,
+  Plus,
   RefreshCw,
+  Save,
   Search,
+  Send,
   Settings,
   ShieldCheck,
-  SlidersHorizontal,
   Square,
-  TimerReset,
+  Trash2,
+  Wifi,
+  X,
 } from 'lucide-react';
-import { type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
-import { ClientApiError, monitorApi } from './clientApi';
-import type {
-  AccountQuotaRow,
-  AccountQuotaStatus,
-  ConsumptionWindowSummary,
-  LatestPayload,
-  PlanKey,
-  PricingProfile,
-  RefreshBucket,
-} from './shared/domain';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  monitorApi,
+  type CollectorSettings,
+  type CpaTargetConfig,
+  type EmailAlertSettings,
+  type SaveCollectorSettings,
+  type SaveEmailAlertSettings,
+  type SaveTargetInput,
+} from './clientApi';
+import type { AccountQuotaRow, AccountQuotaStatus, LatestPayload, PlanKey, PricingProfile, RiskTone } from './shared/domain';
 import { DEFAULT_PRICING_PROFILE, formatUsd, getPlanLabel, normalizePricingProfile } from './shared/pricing';
 
-type AppRoute = 'overview' | 'accounts' | 'refresh-times';
-type StatusFilter = 'all' | AccountQuotaStatus;
-type PlanFilter = 'all' | PlanKey;
-type BucketMode = 'all' | 'five-hour' | 'weekly';
-type BucketSort = 'time' | 'count';
+const PAGE_AUTO_REFRESH_MS = 30_000;
+const HOUR_MS = 60 * 60 * 1000;
 
-const PAGE_AUTO_REFRESH_MINUTES = 5;
-const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
+type AppModule = 'overview' | 'accounts' | 'settings';
+type AlertSummary = { enabled: boolean; recipients: number; ready: boolean; loading: boolean };
+type SettingsDialog = 'cpa' | 'collector' | 'pricing' | 'alert' | null;
+type CpaDialogMode = 'create' | 'manage';
+type TargetDraft = SaveTargetInput;
+type AccountPlanFilter = PlanKey | 'all';
+type AccountStatusFilter = AccountQuotaStatus | 'all';
+type AccountActionKind = 'refresh' | 'toggle' | 'delete';
+type AccountActionState = { key: string; action: AccountActionKind } | null;
 const PLAN_ORDER: Array<Exclude<PlanKey, 'unknown'>> = ['free', 'plus', 'team', 'pro'];
-const ROUTES: Array<{ id: AppRoute; label: string; icon: ReactNode }> = [
-  { id: 'overview', label: '总览', icon: <LayoutDashboard size={16} aria-hidden="true" /> },
-  { id: 'accounts', label: '账号明细', icon: <ListChecks size={16} aria-hidden="true" /> },
-  { id: 'refresh-times', label: '刷新时间分布', icon: <CalendarClock size={16} aria-hidden="true" /> },
+
+const ACCOUNT_PLAN_FILTERS: Array<{ value: AccountPlanFilter; label: string }> = [
+  { value: 'all', label: '全部套餐' },
+  ...PLAN_ORDER.map((planKey) => ({ value: planKey, label: getPlanLabel(planKey) })),
+  { value: 'unknown', label: '未知套餐' },
 ];
+
+const ACCOUNT_STATUS_FILTERS: Array<{ value: AccountStatusFilter; label: string }> = [
+  { value: 'all', label: '全部状态' },
+  { value: 'active', label: '启用' },
+  { value: 'paused', label: '暂停' },
+  { value: 'failed', label: '失败' },
+  { value: 'unknown', label: '未知' },
+];
+
+const ACCOUNT_ROW_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+
+const MODULES: Array<{ id: AppModule; label: string; icon: ReactNode }> = [
+  {
+    id: 'overview',
+    label: '总览',
+    icon: <LayoutDashboard size={16} aria-hidden="true" />,
+  },
+  {
+    id: 'accounts',
+    label: '账号明细',
+    icon: <ListChecks size={16} aria-hidden="true" />,
+  },
+  {
+    id: 'settings',
+    label: '设置',
+    icon: <Settings size={16} aria-hidden="true" />,
+  },
+];
+
+const DEFAULT_EMAIL_SETTINGS: EmailAlertSettings = {
+  enabled: false,
+  recipients: [],
+  minTone: 'warn',
+  accountIssueThreshold: 1,
+  cooldownMinutes: 30,
+  softIssueCooldownMinutes: 720,
+  timeoutSeconds: 10,
+  maxMessageChars: 4000,
+  smtpHost: '',
+  smtpPort: 465,
+  smtpSecure: true,
+  smtpUsername: '',
+  smtpFrom: '',
+  hasSmtpPassword: false,
+};
+
+const DEFAULT_COLLECTOR_SETTINGS: CollectorSettings = {
+  autoCollectEnabled: true,
+  collectUsageTickSeconds: 300,
+  collectUsageMaxRequestsPerMinute: 30,
+  collectUsageMode: 'full',
+  collectConcurrency: 3,
+  collectManualConcurrency: 8,
+};
 
 function formatInteger(value: number): string {
   return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 }).format(value);
@@ -76,19 +130,7 @@ function formatTime(value: number | null | undefined): string {
   }).format(new Date(value));
 }
 
-function formatHours(value: number | null | undefined): string {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
-  if (value >= 24) return `${(value / 24).toFixed(1)} 天`;
-  if (value >= 10) return `${value.toFixed(0)} 小时`;
-  return `${value.toFixed(1)} 小时`;
-}
-
-function formatPercent(value: number | null | undefined): string {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
-  return `${Math.round(value)}%`;
-}
-
-function formatRelativeAge(value: number | null | undefined): string {
+function formatAge(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
   const minutes = Math.floor(value / 60_000);
   if (minutes < 1) return '刚刚';
@@ -98,58 +140,363 @@ function formatRelativeAge(value: number | null | undefined): string {
   return `${Math.floor(hours / 24)} 天前`;
 }
 
-function formatConsumptionWindow(value: ConsumptionWindowSummary): string {
-  if (value.comparableSeries === 0) return '暂无样本';
-  if (value.totalUsd <= 0 && !value.zeroConsumptionReliable) return '未采到消耗';
-  return formatUsd(value.totalUsd);
+function formatSupportHours(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '样本不足';
+  return `${value.toFixed(1)} 小时`;
 }
 
-function formatBurnRateBasis(value: LatestPayload['risk']['burnRateBasis']): string {
-  if (value === 'three-hour') return '近 3h 均速';
-  if (value === 'one-hour') return '近 1h 提速';
-  if (value === 'thirty-minute-spike') return '近 30m 突增';
-  if (value === 'zero') return '近期低消耗';
+function getCapacityStatusLabel(latest: LatestPayload): string {
+  const capacity = latest.capacity;
+  if (capacity.status === 'ready') return '充足';
+  if (capacity.status === 'tight') return '紧张';
+  if (capacity.status === 'untrusted') return '样本不足';
+  if (capacity.status === 'updating') return '更新中';
+  if (capacity.status === 'collecting') return '采集中';
+  return '等待采集';
+}
+
+function getCapacityStatusToneClass(latest: LatestPayload): string {
+  const { capacity, risk } = latest;
+  if (capacity.status === 'tight' || risk.tone === 'critical') return 'snapshot-primary-critical';
+  if (risk.tone === 'warn' || risk.tone === 'watch' || capacity.status === 'untrusted') return 'snapshot-primary-watch';
+  if (capacity.status === 'ready') return 'snapshot-primary-ready';
+  return 'snapshot-primary-muted';
+}
+
+function hasCapacityCoverageGap(capacity: LatestPayload['capacity']): boolean {
+  return capacity.enabledAccounts > 0 && capacity.includedAccounts < capacity.enabledAccounts;
+}
+
+function getCapacityCoverageLabel(capacity: LatestPayload['capacity']): string {
+  if (capacity.enabledAccounts <= 0) return '无启用账号';
+  return `可测容量 ${formatInteger(capacity.includedAccounts)}/${formatInteger(capacity.enabledAccounts)} 账号`;
+}
+
+function getCapacityCoverageShortLabel(capacity: LatestPayload['capacity']): string {
+  if (capacity.enabledAccounts <= 0) return '无启用账号';
+  return `可测 ${formatInteger(capacity.includedAccounts)}/${formatInteger(capacity.enabledAccounts)}`;
+}
+
+function hasCapacityBaseline(capacity: LatestPayload['capacity']): boolean {
+  return typeof capacity.snapshotCapturedAt === 'number' && Number.isFinite(capacity.snapshotCapturedAt);
+}
+
+function hasPartialCapacityBaseline(capacity: LatestPayload['capacity']): boolean {
+  return hasCapacityBaseline(capacity) && !capacity.freshComplete;
+}
+
+function getExcludedCapacityLabel(capacity: LatestPayload['capacity']): string {
+  return `${formatInteger(Math.max(0, capacity.excludedAccounts))} 个异常未计入容量`;
+}
+
+function isSoftQuotaWindowIssue(row: AccountQuotaRow): boolean {
+  const error = row.error?.trim() ?? '';
+  return error.startsWith('缺少 ') && error.endsWith('主窗口额度数据');
+}
+
+function isDeactivatedWorkspaceIssue(row: AccountQuotaRow): boolean {
+  return (row.error ?? '').includes('deactivated_workspace');
+}
+
+function getCapacityExcludedIssueRows(latest: LatestPayload): AccountQuotaRow[] {
+  return latest.accounts.filter((row) => !row.disabled && isIssueRow(row));
+}
+
+function hasIssueOnlyCapacityExclusion(latest: LatestPayload): boolean {
+  const excluded = Math.max(0, latest.capacity.excludedAccounts);
+  if (!hasCapacityBaseline(latest.capacity) || !hasCapacityCoverageGap(latest.capacity) || excluded <= 0) return false;
+  if (latest.capacity.includedAccounts <= 0) return false;
+  return getCapacityExcludedIssueRows(latest).length >= excluded;
+}
+
+function getCapacityExcludedIssueLabel(latest: LatestPayload): string {
+  const excluded = Math.max(0, latest.capacity.excludedAccounts);
+  const issueRows = getCapacityExcludedIssueRows(latest);
+  const quotaWindowIssues = issueRows.filter(isSoftQuotaWindowIssue).length;
+  const deactivatedWorkspaceIssues = issueRows.filter(isDeactivatedWorkspaceIssue).length;
+
+  if (deactivatedWorkspaceIssues >= excluded) {
+    return `${formatInteger(excluded)} 个停用工作区账号已排除`;
+  }
+  if (quotaWindowIssues >= excluded) {
+    return `${formatInteger(excluded)} 个额度显示异常已排除`;
+  }
+  if (quotaWindowIssues + deactivatedWorkspaceIssues >= excluded) {
+    return `${formatInteger(excluded)} 个已知异常账号已排除`;
+  }
+  return `${formatInteger(excluded)} 个异常账号已排除`;
+}
+
+function getCapacityTightDetail(latest: LatestPayload): string {
+  const detail = latest.risk.detail.trim();
+  if ((latest.risk.tone === 'warn' || latest.risk.tone === 'critical') && detail) return detail;
+  if (latest.capacity.estimatedDepletionAt) {
+    return `按当前消耗趋势估算，容量预计在 ${formatDateTime(latest.capacity.estimatedDepletionAt)} 前后耗尽。`;
+  }
+  return '按当前消耗趋势估算，剩余可调度容量偏紧。';
+}
+
+function getCapacityStatusDetail(latest: LatestPayload): string {
+  const capacity = latest.capacity;
+  const collectorState = latest.collectorState;
+  if (capacity.status === 'collecting') {
+    return `本轮 ${collectorState.progressCompletedAccounts ?? 0}/${collectorState.progressTotalAccounts ?? 0}`;
+  }
+  if (capacity.status === 'waiting') {
+    return hasCapacityBaseline(capacity) ? '容量快照已过期，等待下一轮可测采集' : '等待可测 fresh 全量快照';
+  }
+  if (capacity.status === 'tight') return getCapacityTightDetail(latest);
+  if (hasPartialCapacityBaseline(capacity)) {
+    if (hasIssueOnlyCapacityExclusion(latest)) {
+      return `${getCapacityCoverageLabel(capacity)} · ${getCapacityExcludedIssueLabel(latest)} · 按剔除后账号监控`;
+    }
+    return `部分 fresh · ${getCapacityCoverageLabel(capacity)} · ${getExcludedCapacityLabel(capacity)}`;
+  }
+  if (hasCapacityCoverageGap(capacity)) {
+    if (hasIssueOnlyCapacityExclusion(latest)) {
+      return `${getCapacityCoverageLabel(capacity)} · ${getCapacityExcludedIssueLabel(latest)} · 按剔除后账号监控`;
+    }
+    const sample = capacity.hourlyBurnUsd === null || capacity.burnRateBasis === 'insufficient' ? ' · 消耗样本不足' : '';
+    return `${getCapacityCoverageLabel(capacity)} · 部分账号缺少完整容量窗口${sample}`;
+  }
+  if (capacity.hourlyBurnUsd === null || capacity.burnRateBasis === 'insufficient') return '消耗样本不足，等待两轮成功采集';
+  if (capacity.status === 'updating') {
+    return `沿用 ${formatAge(capacity.snapshotAgeMs)} 完整快照 · 本轮 ${collectorState.progressCompletedAccounts ?? 0}/${collectorState.progressTotalAccounts ?? 0}`;
+  }
+  if (capacity.status === 'untrusted') return `等待更多可用样本 · ${getCapacityCoverageShortLabel(capacity)}`;
+  return `按保守消耗 · ${getCapacityCoverageLabel(capacity)}`;
+}
+
+function getCapacityValueLabel(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '等待完整采集';
+  return formatUsd(value);
+}
+
+function getCurrentUsableLabel(capacity: LatestPayload['capacity']): string {
+  if (capacity.freshComplete && capacity.includedAccounts === 0) return '无可测账号';
+  return getCapacityValueLabel(capacity.currentUsableUsd);
+}
+
+function getCapacitySnapshotDetail(latest: LatestPayload): string {
+  const capacity = latest.capacity;
+  if (!hasCapacityBaseline(capacity)) return '等待可测容量基线';
+  if (hasPartialCapacityBaseline(capacity)) {
+    if (hasIssueOnlyCapacityExclusion(latest)) {
+      return `异常已剔除 · ${getCapacityCoverageShortLabel(capacity)} · ${getCapacityExcludedIssueLabel(latest)} · ${formatAge(capacity.snapshotAgeMs)}`;
+    }
+    return `部分 fresh · ${getCapacityCoverageShortLabel(capacity)} · ${formatAge(capacity.snapshotAgeMs)}`;
+  }
+  if (capacity.enabledAccounts > 0) return `${getCapacityCoverageLabel(capacity)} · ${formatAge(capacity.snapshotAgeMs)}`;
+  return `完整快照 ${formatAge(capacity.snapshotAgeMs)}`;
+}
+
+function getHealthSnapshotNote(latest: LatestPayload): string {
+  const capacity = latest.capacity;
+  if (!hasCapacityBaseline(capacity)) return '等待可测 fresh';
+  const coverage = capacity.enabledAccounts > 0
+    ? getCapacityCoverageShortLabel(capacity)
+    : '无启用账号';
+  if (hasPartialCapacityBaseline(capacity)) {
+    if (hasIssueOnlyCapacityExclusion(latest)) {
+      return `异常已剔除 · ${coverage} · ${getCapacityExcludedIssueLabel(latest)} · ${formatDateTime(capacity.snapshotCapturedAt)}`;
+    }
+    return `部分 fresh · ${coverage} · ${getExcludedCapacityLabel(capacity)} · ${formatDateTime(capacity.snapshotCapturedAt)}`;
+  }
+  return `完整 fresh · ${coverage} · ${formatDateTime(capacity.snapshotCapturedAt)}`;
+}
+
+function getCapacityCurveEmptyLabel(capacity: LatestPayload['capacity']): string {
+  if (!hasCapacityBaseline(capacity)) return '等待可测 fresh 快照';
+  if (capacity.status === 'waiting') return '容量快照已过期';
+  return '等待可测容量窗口';
+}
+
+function getForecastValueLabel(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '样本不足';
+  return formatUsd(value);
+}
+
+function getHourlyBurnLabel(capacity: LatestPayload['capacity']): string {
+  const observed = capacity.observedHourlyBurnUsd ?? capacity.hourlyBurnUsd;
+  if (typeof observed !== 'number' || !Number.isFinite(observed)) return '样本不足';
+  return `${formatUsd(observed)} / h`;
+}
+
+function getHourlyBurnDetail(latest: LatestPayload): string {
+  const capacity = latest.capacity;
+  if (capacity.hourlyBurnUsd === null || capacity.burnRateBasis === 'insufficient') return '需要两轮成功采集';
+  const effective = capacity.effectiveHourlyBurnUsd;
+  const warning = typeof effective === 'number' && Number.isFinite(effective)
+    ? `预警按 ${formatUsd(effective)} / h`
+    : '等待保守预警';
+  return `${getBurnRateBasisLabel(capacity.burnRateBasis)} · ${warning} · 覆盖 ${formatBurnCoveragePercent(capacity)}`;
+}
+
+function getSupportLabel(capacity: LatestPayload['capacity']): string {
+  if (capacity.supportStatus === 'idle') return '低消耗';
+  if (capacity.supportStatus === 'beyond-5h') return '> 5h';
+  if (capacity.supportStatus === 'within-5h') return formatSupportHours(capacity.supportHours);
   return '样本不足';
 }
 
-function formatHourlyBurn(latest: LatestPayload): string {
-  if (latest.risk.hourlyBurnUsd === null) return '样本不足';
-  return formatUsd(latest.risk.hourlyBurnUsd);
+function getSupportDetail(capacity: LatestPayload['capacity']): string {
+  if (capacity.supportStatus === 'insufficient-sample') return '需要两轮成功采集';
+  if (capacity.supportStatus === 'idle') return '近期低消耗';
+  if (capacity.supportStatus === 'within-5h') {
+    return capacity.estimatedDepletionAt ? `预计耗尽 ${formatDateTime(capacity.estimatedDepletionAt)}` : '';
+  }
+  return '可覆盖 5h 预测窗口';
 }
 
-function formatCollectorProgress(latest: LatestPayload): string {
-  const state = latest.collectorState;
-  if (state.status !== 'collecting') return '';
-  const total = state.progressTotalAccounts;
-  const completed = state.progressCompletedAccounts ?? 0;
-  if (typeof total !== 'number' || !Number.isFinite(total)) return '';
-  if (total <= 0) return '，本轮无到期账号';
-  return `，本轮查询 ${formatInteger(Math.min(completed, total))}/${formatInteger(total)}`;
+function getProjectedMarginLabel(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '样本不足';
+  if (value < 0) return `缺 ${formatUsd(Math.abs(value))}`;
+  return formatUsd(value);
 }
 
-function formatCurveOffset(offsetMinutes: number): string {
-  if (offsetMinutes === 0) return '现在';
-  return `+${Math.round(offsetMinutes / 60)}h`;
+function getFiveHourCapacityMinimum(capacity: LatestPayload['capacity']): LatestPayload['capacity']['fiveHourTimeline'][number] | null {
+  return capacity.fiveHourTimeline.reduce<LatestPayload['capacity']['fiveHourTimeline'][number] | null>((lowest, point) => {
+    if (!lowest || point.usableUsd < lowest.usableUsd) return point;
+    return lowest;
+  }, null);
 }
 
-function getRouteFromHash(): AppRoute | null {
-  const value = window.location.hash.replace(/^#\/?/, '');
-  if (value === 'overview' || value === 'accounts' || value === 'refresh-times') return value;
+function getBurnRateBasisLabel(value: LatestPayload['capacity']['burnRateBasis']): string {
+  if (value === 'three-hour') return '近 3h 均速';
+  if (value === 'one-hour') return '近 1h 提速';
+  if (value === 'thirty-minute-spike') return '近 30m 突增';
+  if (value === 'zero') return '低消耗';
+  return '样本不足';
+}
+
+function formatBurnCoveragePercent(capacity: LatestPayload['capacity']): string {
+  return Number.isFinite(capacity.consumptionCoveragePercent) ? `${Math.round(capacity.consumptionCoveragePercent)}%` : '-';
+}
+
+function getForecastBurnCaption(capacity: LatestPayload['capacity']): string {
+  const effective = capacity.effectiveHourlyBurnUsd;
+  if (typeof effective !== 'number' || !Number.isFinite(effective)) return '等待消耗样本';
+  return `${getBurnRateBasisLabel(capacity.burnRateBasis)} · 按保守 ${formatUsd(effective)} / h`;
+}
+
+function getCapacityTimelineNow(capacity: LatestPayload['capacity']): number | null {
+  const point = capacity.fiveHourTimeline[0];
+  if (typeof point?.at === 'number' && Number.isFinite(point.at)) return point.at;
   return null;
 }
 
-function navigateTo(route: AppRoute): void {
-  if (window.location.hash !== `#/${route}`) {
-    window.location.hash = `#/${route}`;
-    return;
-  }
-  window.dispatchEvent(new HashChangeEvent('hashchange'));
+function getNextHourReleaseEvents(capacity: LatestPayload['capacity']): LatestPayload['capacity']['twentyFourHourSummary']['releaseEvents'] {
+  const now = getCapacityTimelineNow(capacity);
+  if (now === null) return [];
+  const horizon = now + HOUR_MS;
+  return capacity.twentyFourHourSummary.releaseEvents.filter((event) => event.at > now && event.at <= horizon);
 }
 
-function handlePanelKey(event: KeyboardEvent<HTMLElement>, route: AppRoute): void {
-  if (event.key !== 'Enter' && event.key !== ' ') return;
-  event.preventDefault();
-  navigateTo(route);
+function getNextHourReleaseLabel(capacity: LatestPayload['capacity']): string {
+  const releasedUsd = getNextHourReleaseEvents(capacity).reduce((total, event) => total + Math.max(0, event.releasedUsd), 0);
+  return formatUsd(releasedUsd);
+}
+
+function getNextHourReleaseDetail(capacity: LatestPayload['capacity']): string {
+  const events = getNextHourReleaseEvents(capacity);
+  if (events.length === 0) return '未来 1h 暂无新增';
+  const nearestAt = events.reduce((nearest, event) => Math.min(nearest, event.at), Number.POSITIVE_INFINITY);
+  return `最近 ${formatDateTime(nearestAt)} 新增`;
+}
+
+function getObservedBurnSummary(latest: LatestPayload): string {
+  const enabledAccounts = latest.capacity.enabledAccounts || latest.snapshot?.collection.enabledAccounts || 0;
+  const basisAccounts = getBurnBasisComparableAccounts(latest);
+  const observed = latest.capacity.observedHourlyBurnUsd ?? latest.capacity.hourlyBurnUsd;
+  if (typeof observed !== 'number' || !Number.isFinite(observed)) return `已观测：样本不足 · 覆盖 0/${formatInteger(enabledAccounts)} 账号`;
+  return `已观测：${getBurnRateBasisLabel(latest.capacity.burnRateBasis)} ${formatUsd(observed)} / h · 近 1h ${formatNullableHourlyBurn(latest.risk.oneHourBurnUsd)} · 覆盖 ${formatInteger(basisAccounts)}/${formatInteger(enabledAccounts)} 账号`;
+}
+
+function formatNullableHourlyBurn(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '样本不足';
+  return `${formatUsd(value)} / h`;
+}
+
+function getBurnBasisComparableAccounts(latest: LatestPayload): number {
+  const enabledAccounts = latest.capacity.enabledAccounts || latest.snapshot?.collection.enabledAccounts || 0;
+  const clampComparable = (value: number): number => {
+    if (!Number.isFinite(value) || value <= 0 || enabledAccounts <= 0) return 0;
+    return Math.min(value, enabledAccounts);
+  };
+  const basis = latest.capacity.burnRateBasis;
+  if (basis === 'three-hour') return clampComparable(latest.consumption.threeHours.comparableSeries);
+  if (basis === 'one-hour') return clampComparable(latest.consumption.oneHour.comparableSeries);
+  if (basis === 'thirty-minute-spike') return clampComparable(latest.consumption.thirtyMinutes.comparableSeries);
+  if (basis === 'zero') {
+    return clampComparable(Math.max(
+      latest.consumption.threeHours.comparableSeries,
+      latest.consumption.oneHour.comparableSeries,
+      latest.consumption.thirtyMinutes.comparableSeries,
+    ));
+  }
+  return 0;
+}
+
+function getFiveHourHorizonPoint(capacity: LatestPayload['capacity']): LatestPayload['capacity']['fiveHourTimeline'][number] | null {
+  if (capacity.fiveHourTimeline.length === 0) return null;
+  return capacity.fiveHourTimeline[capacity.fiveHourTimeline.length - 1] ?? null;
+}
+
+function getFiveHourFormula(capacity: LatestPayload['capacity']): string {
+  const horizonPoint = getFiveHourHorizonPoint(capacity);
+  return `${getProjectedMarginLabel(capacity.projectedFiveHourMarginUsd)} = ${getCapacityValueLabel(horizonPoint?.usableUsd)} - ${getForecastValueLabel(capacity.projectedFiveHourSpendUsd)}`;
+}
+
+function getEmailConfigIssues(settings: EmailAlertSettings | null): string[] {
+  if (!settings) return [];
+  const issues: string[] = [];
+  if (!settings.enabled) issues.push('邮箱预警未开启');
+  if (settings.recipients.length === 0) issues.push('收件人未配置');
+  if (!settings.smtpHost.trim()) issues.push('SMTP 服务器未配置');
+  if (!settings.smtpUsername.trim()) issues.push('SMTP 用户名未配置');
+  if (!settings.hasSmtpPassword) issues.push('SMTP 密码未保存');
+  if (!settings.smtpFrom.trim()) issues.push('发件人未配置');
+  return issues;
+}
+
+function formatEmailIssueSummary(issues: string[]): string {
+  if (issues.length === 0) return '邮箱预警已就绪';
+  const preview = issues.slice(0, 3).join('、');
+  return issues.length > 3 ? `${preview} 等 ${formatInteger(issues.length)} 项` : preview;
+}
+
+function getEmailToneLabel(tone: EmailAlertSettings['minTone'] | null | undefined): string {
+  if (tone === 'critical') return '严重';
+  if (tone === 'watch') return '观察及以上';
+  return '警告及以上';
+}
+
+function getCollectorStatusLabel(status: LatestPayload['collectorState']['status']): string {
+  if (status === 'collecting') return '采集中';
+  if (status === 'ok') return '正常';
+  if (status === 'error') return '异常';
+  return '空闲';
+}
+
+function getCollectorProgress(state: LatestPayload['collectorState'] | null | undefined): {
+  running: boolean;
+  label: string;
+  percent: number | null;
+} {
+  if (state?.status !== 'collecting') {
+    return { running: false, label: '立即采集', percent: null };
+  }
+  const total = state.progressTotalAccounts;
+  const completed = state.progressCompletedAccounts ?? 0;
+  if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0) {
+    return { running: true, label: '采集中', percent: null };
+  }
+  const safeCompleted = Math.min(Math.max(0, completed), total);
+  return {
+    running: true,
+    label: `采集中 ${formatInteger(safeCompleted)}/${formatInteger(total)}`,
+    percent: Math.round((safeCompleted / total) * 100),
+  };
 }
 
 function getStatusLabel(status: AccountQuotaStatus): string {
@@ -170,199 +517,174 @@ function isIssueRow(row: AccountQuotaRow): boolean {
   );
 }
 
+function getAccountUsableUsd(row: AccountQuotaRow): number | null {
+  const fiveHourUsd = row.fiveHour?.remainingUsd;
+  const weeklyUsd = row.weekly?.remainingUsd;
+  if (typeof fiveHourUsd !== 'number' || typeof weeklyUsd !== 'number') return null;
+  return Math.max(0, Math.min(fiveHourUsd, weeklyUsd));
+}
+
 function getQuotaSourceLabel(row: AccountQuotaRow): string {
-  if (row.quotaSource === 'paused') return '-';
-  if (row.quotaSource === 'fresh') return row.quotaAgeMs !== null && row.quotaAgeMs < 120_000 ? '刚采集' : `采集 ${formatRelativeAge(row.quotaAgeMs)}`;
-  if (row.quotaSource === 'cached') return `缓存 ${formatRelativeAge(row.quotaAgeMs)}`;
-  if (row.quotaSource === 'backoff') return row.backoffUntil ? `退避至 ${formatTime(row.backoffUntil)}` : '退避中';
-  if (row.quotaSource === 'pending') return '等待采集';
-  return '采集失败';
+  if (row.quotaSource === 'fresh') return 'fresh';
+  if (row.quotaSource === 'cached') return '缓存';
+  if (row.quotaSource === 'backoff') return '退避';
+  if (row.quotaSource === 'pending') return '等待';
+  if (row.quotaSource === 'paused') return '暂停';
+  return '失败';
 }
 
-function getQuotaSourceTitle(row: AccountQuotaRow): string {
-  if (row.quotaSource === 'fresh') return `真实查询时间：${formatDateTime(row.quotaSampledAt)}`;
-  if (row.quotaSource === 'cached') return `沿用上次真实 quota：${formatDateTime(row.quotaSampledAt)}`;
-  if (row.quotaSource === 'backoff') return row.error ?? '账号 usage 查询退避中';
-  if (row.quotaSource === 'pending') return '该账号还没有可沿用的 quota 样本';
-  if (row.quotaSource === 'failed') return row.error ?? '本轮 usage 查询失败';
-  return '暂停账号不请求 quota';
+function getAccountTypeLabel(row: AccountQuotaRow): string {
+  return getPlanLabel(row.normalizedPlan, row.planType);
 }
 
-function formatRecent30m(row: AccountQuotaRow): string {
-  if (row.status === 'paused') return '-';
-  if (row.recent30mConsumptionState === 'no-sample') return '暂无样本';
-  if (row.recent30mConsumptionState === 'unpriced') return '未计价';
-  return formatUsd(row.recent30mConsumedUsd ?? 0);
+function compactText(value: string, maxLength = 36): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1)}…`;
 }
 
-function previewAccounts(accounts: string[]): string {
-  if (accounts.length === 0) return '-';
-  const preview = accounts.slice(0, 5).join('、');
-  return accounts.length > 5 ? `${preview} 等 ${accounts.length} 个` : preview;
-}
-
-function matchesAccountQuery(row: AccountQuotaRow, query: string): boolean {
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) return true;
-  return (
-    row.name.toLowerCase().includes(normalized) ||
-    row.accountId?.toLowerCase().includes(normalized) ||
-    row.planType?.toLowerCase().includes(normalized) ||
-    getPlanLabel(row.normalizedPlan, row.planType).toLowerCase().includes(normalized)
-  );
-}
-
-function filterAccountRows(
-  rows: AccountQuotaRow[],
-  query: string,
-  status: StatusFilter,
-  plan: PlanFilter,
-  issuesOnly: boolean,
-): AccountQuotaRow[] {
-  return rows.filter((row) => {
-    if (!matchesAccountQuery(row, query)) return false;
-    if (status !== 'all' && row.status !== status) return false;
-    if (plan !== 'all' && row.normalizedPlan !== plan) return false;
-    if (issuesOnly && !isIssueRow(row)) return false;
-    return true;
-  });
-}
-
-function filterBucketAccounts(accounts: string[], query: string): string[] {
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) return accounts;
-  return accounts.filter((name) => name.toLowerCase().includes(normalized));
-}
-
-function makeVisibleBucket(bucket: RefreshBucket, query: string, mode: BucketMode): RefreshBucket | null {
-  const fiveHourAccounts = mode === 'weekly' ? [] : filterBucketAccounts(bucket.fiveHourAccounts, query);
-  const weeklyAccounts = mode === 'five-hour' ? [] : filterBucketAccounts(bucket.weeklyAccounts, query);
-  if (fiveHourAccounts.length === 0 && weeklyAccounts.length === 0) return null;
-  return { ...bucket, fiveHourAccounts, weeklyAccounts };
-}
-
-function getBucketTotal(bucket: RefreshBucket): number {
-  return bucket.fiveHourAccounts.length + bucket.weeklyAccounts.length;
-}
-
-function filterRefreshBuckets(
-  buckets: RefreshBucket[],
-  query: string,
-  mode: BucketMode,
-  sort: BucketSort,
-): RefreshBucket[] {
-  const filtered = buckets
-    .map((bucket) => makeVisibleBucket(bucket, query, mode))
-    .filter((bucket): bucket is RefreshBucket => Boolean(bucket));
-
-  if (sort === 'count') {
-    return filtered.sort((left, right) => getBucketTotal(right) - getBucketTotal(left) || left.sortMinute - right.sortMinute);
+function getAccountCollectionNote(row: AccountQuotaRow): string | null {
+  if (row.quotaSource === 'backoff') {
+    if (row.backoffUntil) return `恢复 ${formatDateTime(row.backoffUntil)}`;
+    return row.error ? compactText(row.error) : '本轮暂停采集';
   }
-  return filtered.sort((left, right) => left.sortMinute - right.sortMinute);
+  if (row.error) return compactText(row.error);
+  if (row.requestHeaderSource === 'cpa-metadata') return 'CPA 元数据请求头';
+  return null;
 }
 
-function buildTimelineBuckets(buckets: RefreshBucket[]): RefreshBucket[] {
-  const map = new Map(buckets.map((bucket) => [bucket.sortMinute, bucket]));
-  return Array.from({ length: 288 }, (_, index) => {
-    const sortMinute = index * 5;
-    const hour = Math.floor(sortMinute / 60);
-    const minute = sortMinute % 60;
-    const label = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-    return map.get(sortMinute) ?? { bucket: label, sortMinute, fiveHourAccounts: [], weeklyAccounts: [] };
-  });
+function getAccountFiveHourResetMs(row: AccountQuotaRow): number | null {
+  const resetAtMs = row.fiveHour?.resetAtMs;
+  return typeof resetAtMs === 'number' && Number.isFinite(resetAtMs) ? resetAtMs : null;
 }
 
-function getPeakBuckets(buckets: RefreshBucket[], limit: number): RefreshBucket[] {
-  return [...buckets]
-    .filter((bucket) => getBucketTotal(bucket) > 0)
-    .sort((left, right) => getBucketTotal(right) - getBucketTotal(left) || left.sortMinute - right.sortMinute)
-    .slice(0, limit);
+function compareAccountsByFiveHourReset(left: AccountQuotaRow, right: AccountQuotaRow): number {
+  const leftResetAt = getAccountFiveHourResetMs(left);
+  const rightResetAt = getAccountFiveHourResetMs(right);
+  if (leftResetAt !== null && rightResetAt !== null && leftResetAt !== rightResetAt) return leftResetAt - rightResetAt;
+  if (leftResetAt !== null && rightResetAt === null) return -1;
+  if (leftResetAt === null && rightResetAt !== null) return 1;
+  const nameDelta = ACCOUNT_ROW_COLLATOR.compare(left.name, right.name);
+  if (nameDelta !== 0) return nameDelta;
+  return ACCOUNT_ROW_COLLATOR.compare(left.accountKey, right.accountKey);
 }
 
-function getFilteredStats(rows: AccountQuotaRow[]) {
-  const countableRows = rows.filter(
-    (row) => row.status === 'active' && (row.quotaSource === 'fresh' || row.quotaSource === 'cached'),
-  );
-  const unpricedFiveHour = countableRows.filter((row) => row.fiveHour && !row.fiveHour.priced).length;
-  const unpricedWeekly = countableRows.filter((row) => row.weekly && !row.weekly.priced).length;
+function getAccountSearchHaystack(row: AccountQuotaRow): string {
+  return [row.name, row.accountId ?? '', row.accountKey, row.provider].join(' ').toLocaleLowerCase();
+}
+
+function getAccountAuthFileName(row: AccountQuotaRow): string {
+  return row.authFileName?.trim() || row.name;
+}
+
+function getAccountRowKey(row: AccountQuotaRow): string {
+  return `${row.cpaId}:${row.authFileName ?? row.authId ?? row.accountKey}:${row.name}`;
+}
+
+function parseRecipientInput(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function createEmptyTargetDraft(): TargetDraft {
   return {
-    total: rows.length,
-    active: rows.filter((row) => row.status === 'active').length,
-    paused: rows.filter((row) => row.status === 'paused').length,
-    issues: rows.filter(isIssueRow).length,
-    counted: countableRows.length,
-    unpriced: unpricedFiveHour + unpricedWeekly,
+    id: null,
+    name: '',
+    apiBase: '',
+    enabled: true,
+    managementKey: '',
   };
 }
 
-function KpiCard({
-  icon,
-  label,
-  value,
-  hint,
-  tone = 'neutral',
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-  hint: string;
-  tone?: 'neutral' | 'good' | 'warn' | 'bad';
-}) {
-  return (
-    <article className={`kpi kpi-${tone}`}>
-      <div className="kpi-icon">{icon}</div>
-      <div>
-        <div className="kpi-label">{label}</div>
-        <div className="kpi-value">{value}</div>
-        <div className="kpi-hint">{hint}</div>
-      </div>
-    </article>
-  );
+function createDraftFromTarget(target: CpaTargetConfig): TargetDraft {
+  return {
+    id: target.id,
+    name: target.name,
+    apiBase: target.apiBase,
+    enabled: target.enabled,
+    managementKey: '',
+  };
 }
 
-function MetricPill({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="metric-pill">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
+function TargetSetupPanel({ onConfigured }: { onConfigured: () => Promise<void> }) {
+  const [draft, setDraft] = useState<TargetDraft>(() => createEmptyTargetDraft());
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-function LoginPanel({
-  monitorKey,
-  error,
-  loading,
-  onChange,
-  onSubmit,
-}: {
-  monitorKey: string;
-  error: string | null;
-  loading: boolean;
-  onChange: (value: string) => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
-}) {
+  const updateDraft = <K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    setError(null);
+    setSuccess(null);
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await monitorApi.testTargetConnection(draft);
+      setSuccess(`连接可用：${formatInteger(result.codexAuthFiles)} 个 Codex / ${formatInteger(result.totalAuthFiles)} 个授权文件`);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '连接测试失败');
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      await monitorApi.saveTarget(draft);
+      await onConfigured();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '保存 CPA 配置失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <main className="login-shell">
-      <section className="login-panel" aria-labelledby="login-title">
+    <main className="setup-shell">
+      <section className="setup-panel" aria-labelledby="setup-title">
         <div className="login-mark">
-          <ShieldCheck size={28} aria-hidden="true" />
+          <ShieldCheck size={20} aria-hidden="true" />
         </div>
-        <div>
-          <p className="eyebrow">CPA Quota Monitor</p>
-          <h1 id="login-title">登录监控服务</h1>
-          <p className="login-copy">输入 MONITOR_KEY。CPA Management Key 只保存在服务端环境变量里。</p>
-        </div>
+        <p className="eyebrow">NeoQuota Monitor</p>
+        <h1 id="setup-title">配置第一个 CPA</h1>
+        <p className="login-copy">客户端会把 Management Key 保存到系统钥匙串，配置完成后由桌面后台直接采集账号池额度。</p>
 
-        <form className="login-form" onSubmit={onSubmit}>
+        <form className="login-form" onSubmit={handleSubmit}>
           <label>
-            <span>Monitor Key</span>
+            <span>CPA 名称</span>
             <input
-              value={monitorKey}
-              onChange={(event) => onChange(event.target.value)}
-              placeholder="输入监控页密码"
+              value={draft.name}
+              onChange={(event) => updateDraft('name', event.target.value)}
+              placeholder="Main CPA"
+              autoComplete="off"
+            />
+          </label>
+          <label>
+            <span>CPA API Base</span>
+            <input
+              value={draft.apiBase}
+              onChange={(event) => updateDraft('apiBase', event.target.value)}
+              placeholder="http://127.0.0.1:8398"
+              autoComplete="url"
+            />
+          </label>
+          <label>
+            <span>Management Key</span>
+            <input
+              value={draft.managementKey ?? ''}
+              onChange={(event) => updateDraft('managementKey', event.target.value)}
+              placeholder="输入 CPA management key"
               type="password"
-              autoComplete="current-password"
+              autoComplete="new-password"
             />
           </label>
 
@@ -373,813 +695,1792 @@ function LoginPanel({
             </div>
           ) : null}
 
-          <button className="button button-primary" type="submit" disabled={loading}>
-            {loading ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <LogIn size={16} aria-hidden="true" />}
-            <span>{loading ? '连接中' : '登录'}</span>
-          </button>
+          {success ? (
+            <div className="inline-success" role="status">
+              <CheckCircle2 size={16} aria-hidden="true" />
+              <span>{success}</span>
+            </div>
+          ) : null}
+
+          <div className="form-actions form-actions-split">
+            <button className="button button-secondary" type="button" onClick={() => void handleTest()} disabled={testing || saving}>
+              {testing ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Wifi size={16} aria-hidden="true" />}
+              <span>{testing ? '测试中' : '测试连接'}</span>
+            </button>
+            <button className="button button-primary" type="submit" disabled={saving || testing}>
+              {saving ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
+              <span>{saving ? '保存中' : '保存并开始监控'}</span>
+            </button>
+          </div>
         </form>
       </section>
     </main>
   );
 }
 
-function RiskDashboard({ latest }: { latest: LatestPayload }) {
-  const risk = latest.risk;
-  const collectorState = latest.collectorState;
-  const collection = latest.snapshot?.collection;
-  const strategyLabel =
-    collection?.strategy === 'full' ? '智能采集' : collection?.strategy === 'continuous' ? '自动巡检' : '智能轮询';
-  const collectionPrefix = collectorState.status === 'collecting' ? '上一轮' : '本轮';
-  const collectionText = collection
-    ? `${collectionPrefix}${strategyLabel}：真实查询 ${formatInteger(collection.freshAccounts)}，新增/恢复优先 ${formatInteger(collection.priorityAccounts)}，缓存 ${formatInteger(collection.cachedAccounts)}，退避 ${formatInteger(collection.backoffAccounts)}，等待 ${formatInteger(collection.pendingAccounts)}，失败 ${formatInteger(collection.failedAccounts)}`
-    : '暂无采集摘要';
-  const maxProjected = Math.max(1, ...risk.curve.map((point) => point.projectedUsd));
+function StatusPill({ tone, label }: { tone: RiskTone | 'ok' | 'error' | 'muted'; label: string }) {
+  return <span className={`status-pill status-pill-${tone}`}>{label}</span>;
+}
 
+function HealthRow({ label, value, note }: { label: string; value: string; note: string }) {
   return (
-    <section className={`risk-panel risk-${risk.tone}`} aria-label="号池风险判断">
-      <div className="risk-main">
-        <div className="prediction-icon">
-          <Clock size={22} aria-hidden="true" />
-        </div>
-        <div>
-          <p className="eyebrow">号池稳定性预警</p>
-          <h2>{risk.title}</h2>
-          <p>{risk.detail}</p>
-          <p className="collector-line">
-            保守 5h {formatUsd(risk.conservativeFiveHourUsd)}，账面 5h {formatUsd(risk.nominalFiveHourUsd)}，预计可撑{' '}
-            {formatHours(risk.availableHours)}，预计耗尽 {formatDateTime(risk.estimatedDepletionAt)}
-          </p>
-          <p className="collector-line">
-            采集状态：{collectorState.status}
-            {formatCollectorProgress(latest)}，下次采集 {formatTime(collectorState.nextRunAt)}
-            {collectorState.lastError ? `，错误：${collectorState.lastError}` : ''}
-          </p>
-          <p className="collector-line">{collectionText}</p>
-        </div>
-      </div>
-
-      <div className="risk-side">
-        <div className="risk-metrics">
-          <MetricPill label="估算每小时" value={formatHourlyBurn(latest)} />
-          <MetricPill label="近 3 小时消耗" value={formatConsumptionWindow(latest.consumption.threeHours)} />
-          <MetricPill label="估算口径" value={formatBurnRateBasis(risk.burnRateBasis)} />
-          <MetricPill label="消耗覆盖" value={formatPercent(risk.consumptionCoveragePercent)} />
-          <MetricPill label="可信覆盖" value={formatPercent(risk.trustedCoveragePercent)} />
-        </div>
-        <div className="capacity-curve" aria-label="未来 5 小时容量曲线">
-          {risk.curve.map((point) => (
-            <div className="curve-point" key={point.offsetMinutes}>
-              <div className="curve-bar-track">
-                <div
-                  className="curve-bar"
-                  style={{ height: `${Math.max(8, Math.round((point.projectedUsd / maxProjected) * 100))}%` }}
-                />
-              </div>
-              <span>{formatCurveOffset(point.offsetMinutes)}</span>
-              <strong>{formatUsd(point.projectedUsd)}</strong>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
+    <div className="health-row">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <em>{note}</em>
+    </div>
   );
 }
 
-function PageNav({ route }: { route: AppRoute }) {
-  return (
-    <nav className="page-nav" aria-label="监控页面">
-      {ROUTES.map((item) => (
-        <button
-          key={item.id}
-          className={`nav-button ${route === item.id ? 'nav-button-active' : ''}`}
-          onClick={() => navigateTo(item.id)}
-        >
-          {item.icon}
-          <span>{item.label}</span>
-        </button>
-      ))}
-    </nav>
-  );
-}
-
-function AccountTable({
-  rows,
-  page,
-  pageSize,
-  onPageChange,
-  onPageSizeChange,
+function CapacityCurve({
+  points,
+  emptyLabel = '等待完整 fresh 快照',
 }: {
-  rows: AccountQuotaRow[];
-  page: number;
-  pageSize: number;
-  onPageChange: (page: number) => void;
-  onPageSizeChange: (pageSize: number) => void;
+  points: LatestPayload['capacity']['fiveHourTimeline'];
+  emptyLabel?: string;
 }) {
-  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
-  const safePage = Math.min(Math.max(1, page), totalPages);
-  const startIndex = (safePage - 1) * pageSize;
-  const pageRows = rows.slice(startIndex, startIndex + pageSize);
-  const rangeStart = rows.length === 0 ? 0 : startIndex + 1;
-  const rangeEnd = Math.min(startIndex + pageSize, rows.length);
+  const maxProjected = Math.max(1, ...points.map((point) => Math.max(0, point.projectedRemainingUsd ?? point.usableUsd)));
 
   return (
-    <>
-      <div className="table-toolbar">
-        <div className="table-range">
-          {rangeStart}-{rangeEnd} / 共 {formatInteger(rows.length)} 条
+    <div className="capacity-chart" aria-label="未来 5 小时保守预计余量曲线">
+      {points.length === 0 ? (
+        <div className="empty-chart">
+          <Clock size={18} aria-hidden="true" />
+          <span>{emptyLabel}</span>
         </div>
-        <div className="pager-controls">
-          <select
-            className="select compact-select"
-            value={pageSize}
-            onChange={(event) => onPageSizeChange(Number(event.target.value))}
-            aria-label="每页条数"
+      ) : (
+        points.map((point) => (
+          <div className="chart-column" key={point.offsetMinutes}>
+            <div className="chart-track">
+              <div
+                className={`chart-bar ${(point.projectedRemainingUsd ?? 0) < 0 ? 'chart-bar-negative' : ''}`}
+                style={{ height: `${Math.max(8, Math.round((Math.max(0, point.projectedRemainingUsd ?? point.usableUsd) / maxProjected) * 100))}%` }}
+              />
+            </div>
+            <span>{point.offsetMinutes === 0 ? '现在' : `+${Math.round(point.offsetMinutes / 60)}h`}</span>
+            <strong>{getProjectedMarginLabel(point.projectedRemainingUsd ?? point.usableUsd)}</strong>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function OverviewModule({
+  latest,
+  alertSummary,
+  emailIssues,
+  onOpenSettings,
+}: {
+  latest: LatestPayload;
+  alertSummary: AlertSummary;
+  emailIssues: string[];
+  onOpenSettings: () => void;
+}) {
+  const capacity = latest.capacity;
+  const collection = latest.snapshot?.collection;
+  const issueCount = latest.accounts.filter(isIssueRow).length;
+  const showAttention = !alertSummary.loading && emailIssues.length > 0;
+  const fiveHourCapacityMinimum = getFiveHourCapacityMinimum(capacity);
+
+  return (
+    <div className="overview-module">
+      {showAttention ? (
+        <section className="content-card attention-strip attention-strip-watch" aria-label="配置待办">
+          <StatusPill tone="watch" label="待配置" />
+          <div className="attention-copy">
+            <strong>邮箱预警未就绪</strong>
+            <span>{formatEmailIssueSummary(emailIssues)}</span>
+          </div>
+          <button
+            className="button button-primary"
+            type="button"
+            onClick={onOpenSettings}
           >
-            {PAGE_SIZE_OPTIONS.map((size) => (
-              <option key={size} value={size}>
-                每页 {size}
+            <span>配置邮箱预警</span>
+          </button>
+        </section>
+      ) : null}
+
+      <section className="content-card snapshot-card" aria-label="关键指标">
+        <div className={`snapshot-metric snapshot-primary ${getCapacityStatusToneClass(latest)}`}>
+          <span>容量状态</span>
+          <strong>{getCapacityStatusLabel(latest)}</strong>
+          <em>{getCapacityStatusDetail(latest)}</em>
+        </div>
+        <div className="snapshot-metric">
+          <span>估算每小时消耗</span>
+          <strong>{getHourlyBurnLabel(capacity)}</strong>
+          <em>{getHourlyBurnDetail(latest)}</em>
+        </div>
+        <div className="snapshot-metric">
+          <span>当前可调度</span>
+          <strong>{getCurrentUsableLabel(capacity)}</strong>
+          <em>{getCapacitySnapshotDetail(latest)}</em>
+        </div>
+        <div className="snapshot-metric">
+          <span>预计可撑</span>
+          <strong>{getSupportLabel(capacity)}</strong>
+          <em>{getSupportDetail(capacity)}</em>
+        </div>
+        <div className="snapshot-metric">
+          <span>未来 1h 新增</span>
+          <strong>{getNextHourReleaseLabel(capacity)}</strong>
+          <em>{getNextHourReleaseDetail(capacity)}</em>
+        </div>
+      </section>
+
+      <div className="overview-grid">
+        <section className="content-card forecast-card" aria-label="容量预测">
+          <div className="card-head">
+            <div>
+              <p className="eyebrow">Forecast</p>
+              <h2>容量预估</h2>
+            </div>
+            <span className="card-caption">
+              {getForecastBurnCaption(capacity)}
+            </span>
+          </div>
+
+          <CapacityCurve
+            points={capacity.fiveHourTimeline}
+            emptyLabel={getCapacityCurveEmptyLabel(capacity)}
+          />
+          <div className="forecast-formula">
+            <span>按保守消耗：5h 后预计剩余 = 5h 后账面容量 - 预计 5h 消耗</span>
+            <strong>{getFiveHourFormula(capacity)}</strong>
+          </div>
+          <div className="forecast-caption">
+            <span>按保守 5h 消耗 {getForecastValueLabel(capacity.projectedFiveHourSpendUsd)}</span>
+            <span>按保守剩余 {getProjectedMarginLabel(capacity.projectedFiveHourMarginUsd)}</span>
+            <span>账面 5h 最低 {getCapacityValueLabel(fiveHourCapacityMinimum?.usableUsd)}</span>
+            <span>24h 新增 {getCapacityValueLabel(capacity.twentyFourHourSummary.projectedAddedUsableUsd)}</span>
+            <span>已观测消耗 {getObservedBurnSummary(latest)}</span>
+          </div>
+        </section>
+
+        <section className="content-card health-card" aria-label="运行健康">
+          <div className="card-head">
+            <div>
+              <p className="eyebrow">Checks</p>
+              <h2>运行检查</h2>
+            </div>
+            <span className="card-caption">当前 CPA</span>
+          </div>
+
+          <div className="health-list">
+            <HealthRow
+              label="采集"
+              value={formatTime(latest.collectorState.nextRunAt)}
+              note={`${getCollectorStatusLabel(latest.collectorState.status)} · 本轮 ${latest.collectorState.progressCompletedAccounts ?? 0}/${latest.collectorState.progressTotalAccounts ?? 0}`}
+            />
+            <HealthRow
+              label="快照"
+              value={capacity.snapshotAgeMs === null ? '-' : formatAge(capacity.snapshotAgeMs)}
+              note={getHealthSnapshotNote(latest)}
+            />
+            <HealthRow
+              label="查询"
+              value={collection ? `${formatInteger(collection.freshAccounts)} / ${formatInteger(collection.failedAccounts)}` : '-'}
+              note="成功 / 失败"
+            />
+            <HealthRow
+              label="冷却"
+              value={collection ? `${formatInteger(collection.backoffAccounts)} 个` : '-'}
+              note="403 / 429 / challenge 退避"
+            />
+            <HealthRow label="账号" value={`${formatInteger(issueCount)} 异常`} note={`${formatInteger(latest.accounts.length)} 个账号`} />
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function AccountStatusBadge({ status }: { status: AccountQuotaStatus }) {
+  return <span className={`account-status account-status-${status}`}>{getStatusLabel(status)}</span>;
+}
+
+function AccountDetailsModule({
+  accounts,
+  accountAction,
+  refreshDisabled,
+  onRefreshAccount,
+  onToggleAccount,
+  onDeleteAccount,
+}: {
+  accounts: AccountQuotaRow[];
+  accountAction: AccountActionState;
+  refreshDisabled: boolean;
+  onRefreshAccount: (row: AccountQuotaRow) => Promise<void> | void;
+  onToggleAccount: (row: AccountQuotaRow, enabled: boolean) => Promise<void> | void;
+  onDeleteAccount: (row: AccountQuotaRow) => Promise<void> | void;
+}) {
+  const [searchText, setSearchText] = useState('');
+  const [planFilter, setPlanFilter] = useState<AccountPlanFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>('all');
+  const [issueOnly, setIssueOnly] = useState(false);
+  const [withFiveHourResetOnly, setWithFiveHourResetOnly] = useState(false);
+
+  const normalizedSearchText = searchText.trim().toLocaleLowerCase();
+  const filtersActive =
+    normalizedSearchText !== '' ||
+    planFilter !== 'all' ||
+    statusFilter !== 'all' ||
+    issueOnly ||
+    withFiveHourResetOnly;
+
+  const rows = useMemo(() => {
+    return accounts
+      .filter((row) => {
+        if (normalizedSearchText && !getAccountSearchHaystack(row).includes(normalizedSearchText)) return false;
+        if (planFilter !== 'all' && row.normalizedPlan !== planFilter) return false;
+        if (statusFilter !== 'all' && row.status !== statusFilter) return false;
+        if (issueOnly && !isIssueRow(row)) return false;
+        if (withFiveHourResetOnly && getAccountFiveHourResetMs(row) === null) return false;
+        return true;
+      })
+      .sort(compareAccountsByFiveHourReset);
+  }, [accounts, issueOnly, normalizedSearchText, planFilter, statusFilter, withFiveHourResetOnly]);
+  const issueCount = useMemo(() => rows.filter(isIssueRow).length, [rows]);
+  const caption = filtersActive
+    ? `${formatInteger(issueCount)} 异常 / ${formatInteger(rows.length)} 匹配 / ${formatInteger(accounts.length)} 总计`
+    : `${formatInteger(issueCount)} 异常 / ${formatInteger(accounts.length)}`;
+
+  const resetFilters = () => {
+    setSearchText('');
+    setPlanFilter('all');
+    setStatusFilter('all');
+    setIssueOnly(false);
+    setWithFiveHourResetOnly(false);
+  };
+
+  return (
+    <section className="content-card accounts-card" aria-label="账号明细">
+      <div className="card-head">
+        <div>
+          <p className="eyebrow">Accounts</p>
+          <h2>账号明细</h2>
+        </div>
+        <span className="card-caption">{caption}</span>
+      </div>
+
+      <div className="accounts-filter-bar" aria-label="账号筛选">
+        <label className="account-search-field">
+          <Search size={15} aria-hidden="true" />
+          <span className="sr-only">搜索账号</span>
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="搜索账号、ID、provider"
+          />
+        </label>
+        <label className="account-filter-field">
+          <span className="sr-only">套餐</span>
+          <select value={planFilter} onChange={(event) => setPlanFilter(event.target.value as AccountPlanFilter)}>
+            {ACCOUNT_PLAN_FILTERS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
               </option>
             ))}
           </select>
-          <button className="icon-button" title="上一页" disabled={safePage <= 1} onClick={() => onPageChange(safePage - 1)}>
-            <ChevronLeft size={17} aria-hidden="true" />
-          </button>
-          <span className="page-indicator">
-            {safePage} / {totalPages}
-          </span>
-          <button
-            className="icon-button"
-            title="下一页"
-            disabled={safePage >= totalPages}
-            onClick={() => onPageChange(safePage + 1)}
-          >
-            <ChevronRight size={17} aria-hidden="true" />
-          </button>
-        </div>
+        </label>
+        <label className="account-filter-field">
+          <span className="sr-only">状态</span>
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as AccountStatusFilter)}>
+            {ACCOUNT_STATUS_FILTERS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="switch account-filter-toggle">
+          <input type="checkbox" checked={issueOnly} onChange={(event) => setIssueOnly(event.target.checked)} />
+          <span className="switch-track">{issueOnly ? <CheckCircle2 size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}</span>
+          <span>只看异常</span>
+        </label>
+        <label className="switch account-filter-toggle">
+          <input type="checkbox" checked={withFiveHourResetOnly} onChange={(event) => setWithFiveHourResetOnly(event.target.checked)} />
+          <span className="switch-track">{withFiveHourResetOnly ? <CheckCircle2 size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}</span>
+          <span>有 5h 时间</span>
+        </label>
+        <button className="button button-secondary account-filter-clear" type="button" onClick={resetFilters} disabled={!filtersActive}>
+          <X size={14} aria-hidden="true" />
+          <span>清空</span>
+        </button>
       </div>
-      <div className="table-wrap detail-table-wrap">
+
+      <div className="account-table-wrap">
         <table className="accounts-table">
           <thead>
             <tr>
-              <th className="sticky-col">账号名</th>
+              <th>账号</th>
+              <th>类型</th>
               <th>状态</th>
-              <th>套餐</th>
-              <th>5h 剩余 $</th>
-              <th>5h 刷新时间</th>
-              <th>周剩余 $</th>
-              <th>周刷新时间</th>
-              <th>近 30 分钟消耗 $</th>
-              <th>数据来源</th>
-              <th>错误信息</th>
+              <th>可调度</th>
+              <th>5h 剩余</th>
+              <th>周限剩余</th>
+              <th>5h 重置</th>
+              <th>周重置</th>
+              <th>采集</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            {pageRows.length === 0 ? (
+            {rows.length === 0 ? (
               <tr>
                 <td colSpan={10} className="empty-cell">
-                  没有匹配的 Codex 账号
+                  {accounts.length === 0 ? (
+                    '暂无账号数据'
+                  ) : (
+                    <div className="account-empty-state">
+                      <strong>没有匹配账号</strong>
+                      <span>调整筛选条件后再试</span>
+                      <button className="button button-secondary account-filter-reset-inline" type="button" onClick={resetFilters}>
+                        <X size={14} aria-hidden="true" />
+                        <span>清空筛选</span>
+                      </button>
+                    </div>
+                  )}
                 </td>
               </tr>
             ) : (
-              pageRows.map((row) => (
-                <tr key={`${row.cpaId}:${row.name}`}>
-                  <td className="sticky-col">
-                    <div className="account-name">{row.name}</div>
-                    {row.accountId ? <div className="account-sub">{row.accountId}</div> : null}
-                  </td>
-                  <td>
-                    <span className={`status status-${row.status}`}>{getStatusLabel(row.status)}</span>
-                  </td>
-                  <td>{getPlanLabel(row.normalizedPlan, row.planType)}</td>
-                  <td>{formatUsd(row.fiveHour?.remainingUsd)}</td>
-                  <td>{formatDateTime(row.fiveHour?.resetAtMs)}</td>
-                  <td>{formatUsd(row.weekly?.remainingUsd)}</td>
-                  <td>{formatDateTime(row.weekly?.resetAtMs)}</td>
-                  <td>{formatRecent30m(row)}</td>
-                  <td>
-                    <span className={`source-badge source-${row.quotaSource}`} title={getQuotaSourceTitle(row)}>
-                      {getQuotaSourceLabel(row)}
-                    </span>
-                  </td>
-                  <td className={row.error ? 'error-text' : 'muted-text'}>{row.error ?? '-'}</td>
-                </tr>
-              ))
+              rows.map((row) => {
+                const collectionNote = getAccountCollectionNote(row);
+                const rowActionKey = getAccountRowKey(row);
+                const rowAction = accountAction?.key === rowActionKey ? accountAction.action : null;
+                const rowRefreshing = rowAction === 'refresh';
+                const rowToggling = rowAction === 'toggle';
+                const rowDeleting = rowAction === 'delete';
+                const rowActionDisabled = refreshDisabled || accountAction !== null;
+                const accountTypeLabel = getAccountTypeLabel(row);
+                const authFileName = getAccountAuthFileName(row);
+                return (
+                  <tr className={isIssueRow(row) ? 'issue-row' : undefined} key={rowActionKey}>
+                    <td>
+                      <div className="account-name">
+                        <div className="account-title-line">
+                          <strong title={row.name}>{row.name}</strong>
+                        </div>
+                        <span>{row.accountId ?? row.provider}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <span className={`account-type-badge account-type-${row.normalizedPlan}`} title={`账号类型：${accountTypeLabel}`}>
+                        {accountTypeLabel}
+                      </span>
+                    </td>
+                    <td><AccountStatusBadge status={row.status} /></td>
+                    <td>{formatUsd(getAccountUsableUsd(row))}</td>
+                    <td>{formatUsd(row.fiveHour?.remainingUsd)}</td>
+                    <td>{formatUsd(row.weekly?.remainingUsd)}</td>
+                    <td>{formatDateTime(row.fiveHour?.resetAtMs)}</td>
+                    <td>{formatDateTime(row.weekly?.resetAtMs)}</td>
+                    <td>
+                      <div className="source-cell">
+                        <span className={`source-badge source-${row.quotaSource}`}>{getQuotaSourceLabel(row)}</span>
+                        {collectionNote ? <small title={row.error ?? collectionNote}>{collectionNote}</small> : null}
+                      </div>
+                    </td>
+                    <td>
+                      <div className="account-action-cell">
+                        <button
+                          className="icon-button account-refresh-button"
+                          type="button"
+                          title={`手动刷新 ${row.name}`}
+                          aria-label={`手动刷新账号 ${row.name}`}
+                          onClick={() => void onRefreshAccount(row)}
+                          disabled={rowActionDisabled}
+                        >
+                          <RefreshCw size={14} className={rowRefreshing ? 'spin' : undefined} aria-hidden="true" />
+                        </button>
+                        <button
+                          className="icon-button account-delete-button"
+                          type="button"
+                          title={`删除凭证 ${authFileName}`}
+                          aria-label={`删除凭证 ${authFileName}`}
+                          onClick={() => void onDeleteAccount(row)}
+                          disabled={rowActionDisabled}
+                        >
+                          {rowDeleting ? <RefreshCw size={14} className="spin" aria-hidden="true" /> : <Trash2 size={14} aria-hidden="true" />}
+                        </button>
+                        <label className="switch account-enable-toggle" title={row.disabled ? `启用 ${authFileName}` : `停用 ${authFileName}`}>
+                          <input
+                            type="checkbox"
+                            checked={!row.disabled}
+                            onChange={(event) => void onToggleAccount(row, event.target.checked)}
+                            disabled={rowActionDisabled}
+                            aria-label={`${row.disabled ? '启用' : '停用'}凭证 ${authFileName}`}
+                          />
+                          <span className="switch-track">
+                            {rowToggling ? (
+                              <RefreshCw size={12} className="spin" aria-hidden="true" />
+                            ) : !row.disabled ? (
+                              <CheckCircle2 size={12} aria-hidden="true" />
+                            ) : (
+                              <Square size={12} aria-hidden="true" />
+                            )}
+                          </span>
+                          <span>启用</span>
+                        </label>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
       </div>
-    </>
+    </section>
   );
 }
 
-function PricingPanel({
+function CpaTargetsPanel({
+  targets,
+  onChanged,
+  initialMode,
+  initialTargetId,
+}: {
+  targets: CpaTargetConfig[];
+  onChanged: () => Promise<void>;
+  initialMode: CpaDialogMode;
+  initialTargetId: string | null;
+}) {
+  const initialTarget = initialMode === 'manage'
+    ? targets.find((target) => target.id === initialTargetId) ?? targets[0] ?? null
+    : null;
+  const [draft, setDraft] = useState<TargetDraft>(() => initialTarget ? createDraftFromTarget(initialTarget) : createEmptyTargetDraft());
+  const [editingId, setEditingId] = useState<string | null>(() => initialTarget?.id ?? null);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [busy, setBusy] = useState<'save' | 'test' | 'delete' | null>(null);
+
+  const editingTarget = useMemo(() => targets.find((target) => target.id === editingId) ?? null, [editingId, targets]);
+
+  const resetDraft = () => {
+    setDraft(createEmptyTargetDraft());
+    setEditingId(null);
+    setError(null);
+    setSuccess(null);
+  };
+
+  const editTarget = (target: CpaTargetConfig) => {
+    setDraft(createDraftFromTarget(target));
+    setEditingId(target.id);
+    setError(null);
+    setSuccess(null);
+  };
+
+  const updateDraft = <K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    setError(null);
+    setSuccess(null);
+  };
+
+  const handleTest = async () => {
+    setBusy('test');
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await monitorApi.testTargetConnection(draft);
+      setSuccess(`连接可用：${formatInteger(result.codexAuthFiles)} 个 Codex / ${formatInteger(result.totalAuthFiles)} 个授权文件`);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '连接测试失败');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy('save');
+    setError(null);
+    setSuccess(null);
+    try {
+      await monitorApi.saveTarget(draft);
+      await onChanged();
+      const message = editingId ? 'CPA 配置已更新' : 'CPA 已添加';
+      resetDraft();
+      setSuccess(message);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '保存 CPA 配置失败');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!editingId) return;
+    setBusy('delete');
+    setError(null);
+    try {
+      await monitorApi.deleteTarget(editingId);
+      await onChanged();
+      resetDraft();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '删除 CPA 失败');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="settings-block settings-panel settings-panel-cpa" aria-label="CPA 连接配置">
+      <div className="card-head">
+        <div>
+          <p className="eyebrow">CPA</p>
+          <h2>连接配置</h2>
+        </div>
+        <button className="button button-secondary" type="button" onClick={resetDraft}>
+          <Plus size={16} aria-hidden="true" />
+          <span>新增</span>
+        </button>
+      </div>
+
+      <div className="target-editor-layout">
+        <div className="target-list-panel">
+          <div className="settings-mini-head">
+            <span>已配置 CPA</span>
+            <strong>{targets.length}</strong>
+          </div>
+          <div className="target-list">
+            {targets.length === 0 ? (
+              <div className="target-empty">还没有 CPA 配置</div>
+            ) : (
+              targets.map((target) => (
+                <button
+                  className={`target-row ${editingId === target.id ? 'target-row-active' : ''}`}
+                  key={target.id}
+                  type="button"
+                  onClick={() => editTarget(target)}
+                >
+                  <span>
+                    <strong>{target.name}</strong>
+                    <em>{target.apiBase}</em>
+                  </span>
+                  <StatusPill tone={target.enabled ? 'ok' : 'muted'} label={target.enabled ? '启用' : '停用'} />
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+
+        <form className="alert-form target-form" onSubmit={handleSave}>
+          <div className="settings-mini-head">
+            <span>{editingId ? '编辑连接' : '新增连接'}</span>
+            <strong>{draft.enabled ? '启用' : '停用'}</strong>
+          </div>
+          <div className="form-grid">
+            <label className="form-field">
+              <span>CPA 名称</span>
+              <input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} placeholder="Main CPA" />
+            </label>
+            <label className="form-field">
+              <span>状态</span>
+              <select value={draft.enabled ? 'enabled' : 'disabled'} onChange={(event) => updateDraft('enabled', event.target.value === 'enabled')}>
+                <option value="enabled">启用</option>
+                <option value="disabled">停用</option>
+              </select>
+            </label>
+            <label className="form-field field-wide">
+              <span>CPA API Base</span>
+              <input value={draft.apiBase} onChange={(event) => updateDraft('apiBase', event.target.value)} placeholder="http://127.0.0.1:8398" />
+            </label>
+            <label className="form-field field-wide">
+              <span>Management Key</span>
+              <input
+                value={draft.managementKey ?? ''}
+                onChange={(event) => updateDraft('managementKey', event.target.value)}
+                placeholder={editingTarget?.hasManagementKey ? '已保存，留空不变' : '输入 CPA management key'}
+                type="password"
+                autoComplete="new-password"
+              />
+            </label>
+          </div>
+
+          {error ? (
+            <div className="inline-alert" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              <span>{error}</span>
+            </div>
+          ) : null}
+
+          {success ? (
+            <div className="inline-success" role="status">
+              <CheckCircle2 size={16} aria-hidden="true" />
+              <span>{success}</span>
+            </div>
+          ) : null}
+
+          <div className="form-actions form-actions-split">
+            <div>
+              {editingId ? (
+                <button className="button button-danger" type="button" onClick={() => void handleDelete()} disabled={busy !== null}>
+                  {busy === 'delete' ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Trash2 size={16} aria-hidden="true" />}
+                  <span>删除</span>
+                </button>
+              ) : null}
+            </div>
+            <div className="form-actions-inner">
+              <button className="button button-secondary" type="button" onClick={() => void handleTest()} disabled={busy !== null}>
+                {busy === 'test' ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Wifi size={16} aria-hidden="true" />}
+                <span>测试连接</span>
+              </button>
+              <button className="button button-primary" type="submit" disabled={busy !== null}>
+                {busy === 'save' ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
+                <span>{editingId ? '保存修改' : '添加 CPA'}</span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </section>
+  );
+}
+
+function clampCollectMinutes(value: number): number {
+  if (!Number.isFinite(value)) return 5;
+  return Math.min(60, Math.max(1, Math.round(value)));
+}
+
+function clampCollectConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(10, Math.max(1, Math.round(value)));
+}
+
+function clampUsageRequestsPerMinute(value: number): number {
+  if (!Number.isFinite(value)) return 10;
+  return Math.min(60, Math.max(1, Math.round(value)));
+}
+
+function collectorSecondsToMinutes(settings: CollectorSettings | null): number {
+  return clampCollectMinutes((settings?.collectUsageTickSeconds ?? DEFAULT_COLLECTOR_SETTINGS.collectUsageTickSeconds) / 60);
+}
+
+function CollectorSettingsPanel({
+  settings,
+  onSaved,
+}: {
+  settings: CollectorSettings | null;
+  onSaved: (settings: CollectorSettings) => void;
+}) {
+  const [draft, setDraft] = useState<{
+    autoCollectEnabled?: boolean;
+    collectMinutes?: number;
+    collectConcurrency?: number;
+    collectManualConcurrency?: number;
+    requestsPerMinute?: number;
+  }>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const autoCollectEnabled = draft.autoCollectEnabled ?? settings?.autoCollectEnabled ?? DEFAULT_COLLECTOR_SETTINGS.autoCollectEnabled;
+  const collectMinutes = draft.collectMinutes ?? collectorSecondsToMinutes(settings);
+  const collectConcurrency = draft.collectConcurrency ?? settings?.collectConcurrency ?? DEFAULT_COLLECTOR_SETTINGS.collectConcurrency;
+  const collectManualConcurrency = draft.collectManualConcurrency ?? settings?.collectManualConcurrency ?? DEFAULT_COLLECTOR_SETTINGS.collectManualConcurrency;
+  const requestsPerMinute = draft.requestsPerMinute ?? settings?.collectUsageMaxRequestsPerMinute ?? DEFAULT_COLLECTOR_SETTINGS.collectUsageMaxRequestsPerMinute;
+
+  const buildPayload = (): SaveCollectorSettings => ({
+    autoCollectEnabled,
+    collectUsageTickMinutes: clampCollectMinutes(collectMinutes),
+    collectConcurrency: clampCollectConcurrency(collectConcurrency),
+    collectManualConcurrency: clampCollectConcurrency(collectManualConcurrency),
+    collectUsageMaxRequestsPerMinute: clampUsageRequestsPerMinute(requestsPerMinute),
+  });
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const saved = await monitorApi.saveCollectorSettings(buildPayload());
+      onSaved(saved);
+      setDraft({});
+      setNotice('采集设置已保存');
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '保存采集设置失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-block settings-panel settings-panel-collector" aria-label="采集与刷新设置">
+      <div className="card-head">
+        <div>
+          <p className="eyebrow">Collector</p>
+          <h2>采集与刷新</h2>
+        </div>
+        <StatusPill tone={autoCollectEnabled ? 'ok' : 'muted'} label={autoCollectEnabled ? '自动' : '已暂停'} />
+      </div>
+
+      <form className="alert-form collector-form" onSubmit={handleSubmit}>
+        <div className="collector-layout">
+          <label className="toggle-line collector-toggle">
+            <input
+              type="checkbox"
+              checked={autoCollectEnabled}
+              onChange={(event) => setDraft((current) => ({ ...current, autoCollectEnabled: event.target.checked }))}
+            />
+            <span className="switch-track">
+              {autoCollectEnabled ? <Play size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}
+            </span>
+            <span>后台自动采集</span>
+          </label>
+
+          <div className="form-grid">
+            <label className="form-field">
+              <span>自动采集间隔（分钟）</span>
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={collectMinutes}
+                onChange={(event) => setDraft((current) => ({ ...current, collectMinutes: clampCollectMinutes(Number(event.target.value)) }))}
+              />
+            </label>
+
+            <label className="form-field">
+              <span>后台并发</span>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={collectConcurrency}
+                onChange={(event) => setDraft((current) => ({ ...current, collectConcurrency: clampCollectConcurrency(Number(event.target.value)) }))}
+              />
+            </label>
+
+            <label className="form-field">
+              <span>手动并发</span>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={collectManualConcurrency}
+                onChange={(event) => setDraft((current) => ({ ...current, collectManualConcurrency: clampCollectConcurrency(Number(event.target.value)) }))}
+              />
+            </label>
+
+            <label className="form-field">
+              <span>总限速（次/分钟）</span>
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={requestsPerMinute}
+                onChange={(event) => setDraft((current) => ({ ...current, requestsPerMinute: clampUsageRequestsPerMinute(Number(event.target.value)) }))}
+              />
+            </label>
+
+            <div className="readonly-setting field-wide">
+              <span>页面刷新</span>
+              <strong>固定 30 秒</strong>
+              <em>只刷新本地界面，不触发采集</em>
+            </div>
+          </div>
+        </div>
+
+        <p className="settings-note">
+          并发表示同时处理的采集任务数；总限速是整个客户端每分钟 Usage 请求预算。上一轮未结束时不会并发启动下一轮，手动立即采集仍可使用。
+        </p>
+
+        {error ? (
+          <div className="inline-alert" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{error}</span>
+          </div>
+        ) : null}
+
+        {notice ? (
+          <div className="inline-success" role="status">
+            <CheckCircle2 size={16} aria-hidden="true" />
+            <span>{notice}</span>
+          </div>
+        ) : null}
+
+        <div className="form-actions">
+          <button className="button button-primary" type="submit" disabled={saving}>
+            {saving ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
+            <span>{saving ? '保存中' : '保存采集设置'}</span>
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function AlertSettingsPanel({ onSaved }: { onSaved: (settings: EmailAlertSettings) => void }) {
+  const [settings, setSettings] = useState<EmailAlertSettings>(DEFAULT_EMAIL_SETTINGS);
+  const [smtpPassword, setSmtpPassword] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    monitorApi
+      .alertSettings()
+      .then((payload) => {
+        if (!mounted) return;
+        const normalized = { ...DEFAULT_EMAIL_SETTINGS, ...payload };
+        setSettings(normalized);
+        onSaved(normalized);
+      })
+      .catch((loadError) => {
+        if (mounted) setError(loadError instanceof Error ? loadError.message : '加载邮箱配置失败');
+      })
+      .finally(() => {
+        if (mounted) setLoading(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [onSaved]);
+
+  const updateSetting = <Key extends keyof EmailAlertSettings>(key: Key, value: EmailAlertSettings[Key]) => {
+    setSettings((current) => ({ ...current, [key]: value }));
+    setNotice(null);
+  };
+
+  const buildPayload = (): SaveEmailAlertSettings => ({
+    ...settings,
+    smtpPassword: smtpPassword.trim() ? smtpPassword : undefined,
+  });
+
+  const handleSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const saved = await monitorApi.saveAlertSettings(buildPayload());
+      setSettings(saved);
+      onSaved(saved);
+      setSmtpPassword('');
+      setNotice('邮箱告警配置已保存');
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : '保存邮箱配置失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await monitorApi.sendTestEmail(buildPayload());
+      setSmtpPassword('');
+      setNotice('测试邮件已发送');
+    } catch (testError) {
+      setError(testError instanceof Error ? testError.message : '测试邮件发送失败');
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+      <section className="settings-block settings-panel settings-panel-alert" aria-label="邮箱预警配置">
+        <div className="card-head">
+          <div>
+            <p className="eyebrow">Email Alert</p>
+            <h2>邮箱预警</h2>
+          </div>
+          <StatusPill tone={settings.enabled ? 'ok' : 'muted'} label={settings.enabled ? '开启' : '关闭'} />
+        </div>
+
+        {error ? (
+          <div className="inline-alert" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{error}</span>
+          </div>
+        ) : null}
+        {notice ? (
+          <div className="inline-success" role="status">
+            <CheckCircle2 size={16} aria-hidden="true" />
+            <span>{notice}</span>
+          </div>
+        ) : null}
+
+        <form className="alert-form" onSubmit={handleSave}>
+          <fieldset disabled={loading || saving || testing}>
+            <div className="settings-form-band">
+              <div className="settings-mini-head">
+                <span>告警规则</span>
+                <strong>{settings.enabled ? '开启' : '关闭'}</strong>
+              </div>
+              <label className="toggle-line alert-toggle">
+                <input type="checkbox" checked={settings.enabled} onChange={(event) => updateSetting('enabled', event.target.checked)} />
+                <span className="switch-track">{settings.enabled ? <Play size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}</span>
+                <span>启用邮箱预警</span>
+              </label>
+
+              <label className="form-field field-wide">
+                <span>收件邮箱</span>
+                <input
+                  value={settings.recipients.join(',')}
+                  onChange={(event) => updateSetting('recipients', parseRecipientInput(event.target.value))}
+                  placeholder="ops@example.com,admin@example.com"
+                />
+              </label>
+
+              <div className="form-grid">
+                <label className="form-field">
+                  <span>最低级别</span>
+                  <select
+                    value={settings.minTone}
+                    onChange={(event) => updateSetting('minTone', event.target.value as EmailAlertSettings['minTone'])}
+                  >
+                    <option value="watch">观察及以上</option>
+                    <option value="warn">警告及以上</option>
+                    <option value="critical">严重</option>
+                  </select>
+                </label>
+
+                <label className="form-field">
+                  <span>冷却分钟</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.cooldownMinutes}
+                    onChange={(event) => updateSetting('cooldownMinutes', Math.max(1, Number(event.target.value) || 1))}
+                  />
+                </label>
+
+                <label className="form-field">
+                  <span>软异常冷却</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.softIssueCooldownMinutes}
+                    onChange={(event) => updateSetting('softIssueCooldownMinutes', Math.max(1, Number(event.target.value) || 720))}
+                  />
+                </label>
+
+                <label className="form-field">
+                  <span>异常阈值</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.accountIssueThreshold}
+                    onChange={(event) => updateSetting('accountIssueThreshold', Math.max(1, Number(event.target.value) || 1))}
+                  />
+                </label>
+
+                <label className="form-field">
+                  <span>超时秒数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.timeoutSeconds}
+                    onChange={(event) => updateSetting('timeoutSeconds', Math.max(1, Number(event.target.value) || 1))}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="settings-form-band">
+              <div className="settings-mini-head">
+                <span>SMTP</span>
+                <strong>{settings.hasSmtpPassword ? '已保存密码' : '未保存密码'}</strong>
+              </div>
+              <label className="form-field field-wide">
+                <span>SMTP Host</span>
+                <input value={settings.smtpHost} onChange={(event) => updateSetting('smtpHost', event.target.value)} placeholder="smtp.example.com" />
+              </label>
+
+              <div className="form-grid smtp-grid">
+                <label className="form-field">
+                  <span>SMTP Port</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.smtpPort}
+                    onChange={(event) => updateSetting('smtpPort', Math.max(1, Number(event.target.value) || 465))}
+                  />
+                </label>
+
+                <label className="toggle-line smtp-toggle">
+                  <input type="checkbox" checked={settings.smtpSecure} onChange={(event) => updateSetting('smtpSecure', event.target.checked)} />
+                  <span className="switch-track">
+                    {settings.smtpSecure ? <ShieldCheck size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}
+                  </span>
+                  <span>TLS</span>
+                </label>
+              </div>
+
+              <label className="form-field field-wide">
+                <span>SMTP Username</span>
+                <input value={settings.smtpUsername} onChange={(event) => updateSetting('smtpUsername', event.target.value)} placeholder="monitor@example.com" />
+              </label>
+
+              <label className="form-field field-wide">
+                <span>SMTP Password</span>
+                <input
+                  value={smtpPassword}
+                  onChange={(event) => setSmtpPassword(event.target.value)}
+                  placeholder={settings.hasSmtpPassword ? '已保存，留空不变' : '输入密码'}
+                  type="password"
+                  autoComplete="new-password"
+                />
+              </label>
+
+              <label className="form-field field-wide">
+                <span>From</span>
+                <input value={settings.smtpFrom} onChange={(event) => updateSetting('smtpFrom', event.target.value)} placeholder="NeoQuota Monitor <monitor@example.com>" />
+              </label>
+            </div>
+          </fieldset>
+
+          <div className="form-actions">
+            <button className="button button-secondary" type="button" onClick={() => void handleTest()} disabled={loading || testing || saving}>
+              {testing ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Send size={16} aria-hidden="true" />}
+              <span>{testing ? '发送中' : '测试邮件'}</span>
+            </button>
+            <button className="button button-primary" type="submit" disabled={loading || saving || testing}>
+              {saving ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
+              <span>{saving ? '保存中' : '保存'}</span>
+            </button>
+          </div>
+        </form>
+      </section>
+  );
+}
+
+function isCustomizedPricingProfile(profile: PricingProfile): boolean {
+  return profile.updatedAt > 0 || profile.id !== DEFAULT_PRICING_PROFILE.id;
+}
+
+function pricingValueLabel(value: number | null): string {
+  return typeof value === 'number' && Number.isFinite(value) ? formatUsd(value) : '未计价';
+}
+
+function countUnpricedPricingWindows(profile: PricingProfile): number {
+  return PLAN_ORDER.reduce((total, plan) => {
+    const values = profile.plans[plan];
+    return total + (values.fiveHourUsd === null ? 1 : 0) + (values.weeklyUsd === null ? 1 : 0);
+  }, 0);
+}
+
+function parsePricingValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, parsed);
+}
+
+function PricingSettingsPanel({
   profile,
-  saving,
-  error,
-  onClose,
-  onSave,
+  onSaved,
 }: {
   profile: PricingProfile;
-  saving: boolean;
-  error: string | null;
-  onClose: () => void;
-  onSave: (profile: PricingProfile) => void;
+  onSaved: (profile: PricingProfile) => Promise<void> | void;
 }) {
   const [draft, setDraft] = useState<PricingProfile>(() => normalizePricingProfile(profile));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const updateMeta = <Key extends 'name' | 'sourceLabel'>(key: Key, value: PricingProfile[Key]) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    setNotice(null);
+  };
 
   const updatePlan = (plan: Exclude<PlanKey, 'unknown'>, key: 'fiveHourUsd' | 'weeklyUsd', value: string) => {
     setDraft((current) => ({
       ...current,
+      id: current.id === DEFAULT_PRICING_PROFILE.id ? 'custom-local-pricing' : current.id,
+      name: current.name === DEFAULT_PRICING_PROFILE.name ? '自定义额度换算' : current.name,
+      sourceLabel: current.sourceLabel === DEFAULT_PRICING_PROFILE.sourceLabel ? '后台自定义折算，非官方账单金额' : current.sourceLabel,
       plans: {
         ...current.plans,
         [plan]: {
           ...current.plans[plan],
-          [key]: value.trim() === '' || !Number.isFinite(Number(value)) ? null : Number(value),
+          [key]: parsePricingValue(value),
         },
       },
     }));
+    setNotice(null);
+  };
+
+  const resetToReference = () => {
+    setDraft(normalizePricingProfile(DEFAULT_PRICING_PROFILE));
+    setNotice(null);
+    setError(null);
+  };
+
+  const handleSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const payload = normalizePricingProfile({
+        ...draft,
+        id: draft.id.trim() || 'custom-local-pricing',
+        name: draft.name.trim() || '自定义额度换算',
+        sourceLabel: draft.sourceLabel.trim() || '后台自定义折算，非官方账单金额',
+      });
+      const saved = await monitorApi.savePricing(payload);
+      setDraft(saved);
+      await onSaved(saved);
+      setNotice('额度换算已保存，当前数据已重新估算');
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : '保存额度换算失败');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <section className="workspace-section pricing-panel">
-      <div className="section-head">
+    <section className="settings-block settings-panel settings-panel-pricing" aria-label="额度换算配置">
+      <div className="card-head">
         <div>
-          <h2>价格表配置</h2>
-          <p>按社区实测折算，非官方账单金额；留空表示该窗口未计价。</p>
+          <p className="eyebrow">Quota Pricing</p>
+          <h2>额度换算</h2>
         </div>
-        <div className="actions compact-actions">
-          <button className="button button-secondary" onClick={onClose}>
-            关闭
-          </button>
-          <button className="button button-primary" disabled={saving} onClick={() => onSave(draft)}>
-            {saving ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Settings size={16} aria-hidden="true" />}
-            <span>保存价格表</span>
-          </button>
-        </div>
+        <StatusPill tone={isCustomizedPricingProfile(draft) ? 'ok' : 'muted'} label={isCustomizedPricingProfile(draft) ? '自定义' : '参考值'} />
       </div>
+
       {error ? (
-        <div className="inline-alert pricing-alert" role="alert">
+        <div className="inline-alert" role="alert">
           <AlertTriangle size={16} aria-hidden="true" />
           <span>{error}</span>
         </div>
       ) : null}
-      <div className="pricing-grid">
-        {PLAN_ORDER.map((plan) => (
-          <div className="pricing-row" key={plan}>
-            <strong>{getPlanLabel(plan)}</strong>
-            <label>
-              <span>5h 美元</span>
-              <input
-                value={draft.plans[plan].fiveHourUsd ?? ''}
-                onChange={(event) => updatePlan(plan, 'fiveHourUsd', event.target.value)}
-                inputMode="decimal"
-                placeholder="未计价"
-              />
-            </label>
-            <label>
-              <span>周限美元</span>
-              <input
-                value={draft.plans[plan].weeklyUsd ?? ''}
-                onChange={(event) => updatePlan(plan, 'weeklyUsd', event.target.value)}
-                inputMode="decimal"
-                placeholder="未计价"
-              />
-            </label>
+      {notice ? (
+        <div className="inline-success" role="status">
+          <CheckCircle2 size={16} aria-hidden="true" />
+          <span>{notice}</span>
+        </div>
+      ) : null}
+
+      <form className="alert-form pricing-form" onSubmit={handleSave}>
+        <fieldset disabled={saving}>
+          <div className="settings-form-band">
+            <div className="settings-mini-head">
+              <span>配置</span>
+              <strong>{draft.updatedAt > 0 ? formatDateTime(draft.updatedAt) : '参考默认'}</strong>
+            </div>
+            <div className="form-grid">
+              <label className="form-field">
+                <span>名称</span>
+                <input value={draft.name} onChange={(event) => updateMeta('name', event.target.value)} placeholder="自定义额度换算" />
+              </label>
+              <label className="form-field field-wide">
+                <span>说明</span>
+                <input
+                  value={draft.sourceLabel}
+                  onChange={(event) => updateMeta('sourceLabel', event.target.value)}
+                  placeholder="后台自定义折算，非官方账单金额"
+                />
+              </label>
+            </div>
           </div>
-        ))}
-      </div>
+
+          <div className="settings-form-band">
+            <div className="settings-mini-head">
+              <span>套餐窗口</span>
+              <strong>{countUnpricedPricingWindows(draft)} 个未计价</strong>
+            </div>
+            <div className="pricing-editor-grid">
+              {PLAN_ORDER.map((plan) => (
+                <div className="pricing-editor-row" key={plan}>
+                  <strong>{getPlanLabel(plan)}</strong>
+                  <label>
+                    <span>5h 满额 $</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      inputMode="decimal"
+                      value={draft.plans[plan].fiveHourUsd ?? ''}
+                      onChange={(event) => updatePlan(plan, 'fiveHourUsd', event.target.value)}
+                      placeholder="未计价"
+                    />
+                  </label>
+                  <label>
+                    <span>周限满额 $</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      inputMode="decimal"
+                      value={draft.plans[plan].weeklyUsd ?? ''}
+                      onChange={(event) => updatePlan(plan, 'weeklyUsd', event.target.value)}
+                      placeholder="未计价"
+                    />
+                  </label>
+                </div>
+              ))}
+            </div>
+          </div>
+        </fieldset>
+
+        <p className="settings-note">
+          这里配置的是内部容量换算表：usage 返回的剩余点数会按对应套餐和窗口满额折算，留空表示该套餐窗口不参与金额估算。
+        </p>
+
+        <div className="form-actions">
+          <button className="button button-secondary" type="button" onClick={resetToReference} disabled={saving}>
+            <Calculator size={16} aria-hidden="true" />
+            <span>恢复参考值</span>
+          </button>
+          <button className="button button-primary" type="submit" disabled={saving}>
+            {saving ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
+            <span>{saving ? '保存中' : '保存额度换算'}</span>
+          </button>
+        </div>
+      </form>
     </section>
   );
 }
 
-function OverviewPage({ latest }: { latest: LatestPayload }) {
-  const stats = latest.snapshot?.stats;
-  const risk = latest.risk;
-  const issueRows = latest.accounts.filter(isIssueRow).slice(0, 4);
-  const peakBuckets = getPeakBuckets(latest.refreshBuckets, 5);
-
-  return (
-    <div className="page-stack">
-      <section className="kpi-grid compact-kpi-grid" aria-label="账号池指标">
-        <KpiCard
-          icon={<Gauge size={22} aria-hidden="true" />}
-          label="5h 保守可用"
-          value={formatUsd(risk.conservativeFiveHourUsd)}
-          hint={`账面 ${formatUsd(risk.nominalFiveHourUsd)}，过期缓存 ${formatInteger(risk.staleCachedAccounts)} 个`}
-          tone="good"
-        />
-        <KpiCard
-          icon={<TimerReset size={22} aria-hidden="true" />}
-          label="周保守可用"
-          value={formatUsd(risk.conservativeWeeklyUsd)}
-          hint={`账面 ${formatUsd(risk.nominalWeeklyUsd)}，未计价 ${formatInteger(stats?.unpricedWeeklyAccounts ?? 0)} 个`}
-        />
-        <KpiCard
-          icon={<Clock size={22} aria-hidden="true" />}
-          label="预计可撑"
-          value={formatHours(risk.availableHours)}
-          hint={`预计耗尽 ${formatDateTime(risk.estimatedDepletionAt)}`}
-          tone={risk.tone === 'critical' || risk.tone === 'warn' ? 'bad' : risk.tone === 'watch' ? 'warn' : 'neutral'}
-        />
-        <KpiCard
-          icon={<Activity size={22} aria-hidden="true" />}
-          label="估算每小时消耗"
-          value={formatHourlyBurn(latest)}
-          hint={`${formatBurnRateBasis(risk.burnRateBasis)}，消耗覆盖 ${formatPercent(risk.consumptionCoveragePercent)}`}
-          tone={risk.spikeDetected ? 'warn' : 'neutral'}
-        />
-        <KpiCard
-          icon={<Activity size={22} aria-hidden="true" />}
-          label="启用 / 计入"
-          value={formatInteger(stats?.enabledAccounts ?? 0)}
-          hint={`保守计入 ${formatInteger(risk.freshUsableAccounts + risk.trustedCachedAccounts)}，暂停 ${formatInteger(stats?.pausedAccounts ?? 0)}`}
-        />
-        <KpiCard
-          icon={<AlertTriangle size={22} aria-hidden="true" />}
-          label="失败/未知账号数"
-          value={formatInteger(stats?.failedOrUnknownAccounts ?? 0)}
-          hint="不参与美元总额统计"
-          tone={(stats?.failedOrUnknownAccounts ?? 0) > 0 ? 'bad' : 'neutral'}
-        />
-      </section>
-
-      <RiskDashboard latest={latest} />
-
-      <section className="overview-grid">
-        <article
-          className="overview-panel panel-link"
-          role="button"
-          tabIndex={0}
-          onClick={() => navigateTo('accounts')}
-          onKeyDown={(event) => handlePanelKey(event, 'accounts')}
-        >
-          <div className="section-head section-head-plain">
-            <div>
-              <h2>异常账号预览</h2>
-              <p>失败/未知账号会从美元总额中排除。</p>
-            </div>
-            <span className="panel-count">{formatInteger(stats?.failedOrUnknownAccounts ?? 0)}</span>
-          </div>
-          <div className="preview-list">
-            {issueRows.length === 0 ? (
-              <div className="empty-preview">暂无异常账号</div>
-            ) : (
-              issueRows.map((row) => (
-                <div className="preview-row" key={`${row.cpaId}:${row.name}`}>
-                  <span className={`status status-${row.status}`}>{getStatusLabel(row.status)}</span>
-                  <strong>{row.name}</strong>
-                  <span>{row.error ?? '缺少 quota 数据'}</span>
-                </div>
-              ))
-            )}
-          </div>
-        </article>
-
-        <article
-          className="overview-panel panel-link"
-          role="button"
-          tabIndex={0}
-          onClick={() => navigateTo('refresh-times')}
-          onKeyDown={(event) => handlePanelKey(event, 'refresh-times')}
-        >
-          <div className="section-head section-head-plain">
-            <div>
-              <h2>刷新高峰预览</h2>
-              <p>按 5 分钟桶展示账号刷新集中点。</p>
-            </div>
-            <BarChart3 size={20} aria-hidden="true" />
-          </div>
-          <div className="peak-list">
-            {peakBuckets.length === 0 ? (
-              <div className="empty-preview">暂无刷新时间数据</div>
-            ) : (
-              peakBuckets.map((bucket) => (
-                <div className="peak-row" key={bucket.bucket}>
-                  <span className="bucket-label">{bucket.bucket}</span>
-                  <strong>{formatInteger(getBucketTotal(bucket))} 个</strong>
-                  <span>5h {formatInteger(bucket.fiveHourAccounts.length)} / 周 {formatInteger(bucket.weeklyAccounts.length)}</span>
-                </div>
-              ))
-            )}
-          </div>
-        </article>
-      </section>
-    </div>
-  );
-}
-
-function AccountsPage({ latest }: { latest: LatestPayload }) {
-  const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [planFilter, setPlanFilter] = useState<PlanFilter>('all');
-  const [issuesOnly, setIssuesOnly] = useState(false);
-  const [accountPage, setAccountPage] = useState(1);
-  const [accountPageSize, setAccountPageSize] = useState(25);
-
-  const filteredRows = useMemo(
-    () => filterAccountRows(latest.accounts, search, statusFilter, planFilter, issuesOnly),
-    [issuesOnly, latest.accounts, planFilter, search, statusFilter],
-  );
-  const filteredStats = useMemo(() => getFilteredStats(filteredRows), [filteredRows]);
-  const maxPage = Math.max(1, Math.ceil(filteredRows.length / accountPageSize));
-  const safeAccountPage = Math.min(accountPage, maxPage);
-
-  const resetPage = () => setAccountPage(1);
-
-  return (
-    <section className="workspace-section detail-page">
-      <div className="section-head detail-head">
-        <div>
-          <h2>账号明细</h2>
-          <p>仅统计 Codex 主窗口；美元为社区实测折算，非官方账单金额。</p>
-        </div>
-        <div className="detail-metrics">
-          <MetricPill label="当前结果" value={`${formatInteger(filteredStats.total)} 条`} />
-          <MetricPill label="启用" value={formatInteger(filteredStats.active)} />
-          <MetricPill label="账面计入" value={formatInteger(filteredStats.counted)} />
-          <MetricPill label="暂停" value={formatInteger(filteredStats.paused)} />
-          <MetricPill label="失败/未知" value={formatInteger(filteredStats.issues)} />
-          <MetricPill label="未计价窗口" value={formatInteger(filteredStats.unpriced)} />
-        </div>
-      </div>
-
-      <div className="filter-bar">
-        <label className="search-box">
-          <Search size={16} aria-hidden="true" />
-          <input
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-              resetPage();
-            }}
-            placeholder="搜索账号名、Account ID 或套餐"
-            type="search"
-          />
-        </label>
-        <label className="filter-field">
-          <span>状态</span>
-          <select
-            className="select"
-            value={statusFilter}
-            onChange={(event) => {
-              setStatusFilter(event.target.value as StatusFilter);
-              resetPage();
-            }}
-          >
-            <option value="all">全部</option>
-            <option value="active">启用</option>
-            <option value="paused">暂停</option>
-            <option value="failed">失败</option>
-            <option value="unknown">未知</option>
-          </select>
-        </label>
-        <label className="filter-field">
-          <span>套餐</span>
-          <select
-            className="select"
-            value={planFilter}
-            onChange={(event) => {
-              setPlanFilter(event.target.value as PlanFilter);
-              resetPage();
-            }}
-          >
-            <option value="all">全部</option>
-            <option value="free">普号</option>
-            <option value="plus">Plus</option>
-            <option value="team">Team</option>
-            <option value="pro">Pro</option>
-            <option value="unknown">未知</option>
-          </select>
-        </label>
-        <label className="switch filter-switch" title="仅显示失败或未知账号">
-          <input
-            type="checkbox"
-            checked={issuesOnly}
-            onChange={(event) => {
-              setIssuesOnly(event.target.checked);
-              resetPage();
-            }}
-          />
-          <span className="switch-track">
-            <SlidersHorizontal size={13} aria-hidden="true" />
-          </span>
-          <span>仅看异常</span>
-        </label>
-      </div>
-
-      <AccountTable
-        rows={filteredRows}
-        page={safeAccountPage}
-        pageSize={accountPageSize}
-        onPageChange={setAccountPage}
-        onPageSizeChange={(size) => {
-          setAccountPageSize(size);
-          resetPage();
-        }}
-      />
-    </section>
-  );
-}
-
-function TimelineCell({ bucket, maxCount }: { bucket: RefreshBucket; maxCount: number }) {
-  const total = getBucketTotal(bucket);
-  const level = total === 0 ? 0 : Math.max(1, Math.ceil((total / Math.max(1, maxCount)) * 5));
-  const title = `${bucket.bucket}：合计 ${total}，5h ${bucket.fiveHourAccounts.length}，周 ${bucket.weeklyAccounts.length}`;
+function SettingsModal({
+  eyebrow,
+  title,
+  onClose,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
 
   return (
     <div
-      className={`timeline-cell timeline-level-${level}`}
-      title={title}
-      aria-label={title}
-      role="img"
+      className="settings-modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.currentTarget === event.target) onClose();
+      }}
     >
-      {total > 0 ? <span>{formatInteger(total)}</span> : null}
-    </div>
-  );
-}
-
-function BucketDetailTable({ buckets }: { buckets: RefreshBucket[] }) {
-  const [expandedBucket, setExpandedBucket] = useState<string | null>(null);
-
-  return (
-    <div className="table-wrap">
-      <table className="bucket-table">
-        <thead>
-          <tr>
-            <th>时间桶</th>
-            <th>5h 刷新账号数</th>
-            <th>周刷新账号数</th>
-            <th>账号预览</th>
-            <th>展开</th>
-          </tr>
-        </thead>
-        <tbody>
-          {buckets.length === 0 ? (
-            <tr>
-              <td colSpan={5} className="empty-cell">
-                暂无刷新时间分布
-              </td>
-            </tr>
-          ) : (
-            buckets.map((bucket) => {
-              const isExpanded = expandedBucket === bucket.bucket;
-              const accounts = Array.from(new Set([...bucket.fiveHourAccounts, ...bucket.weeklyAccounts]));
-              return (
-                <tr key={bucket.bucket}>
-                  <td>
-                    <span className="bucket-label">{bucket.bucket}</span>
-                  </td>
-                  <td>{formatInteger(bucket.fiveHourAccounts.length)}</td>
-                  <td>{formatInteger(bucket.weeklyAccounts.length)}</td>
-                  <td className="bucket-preview">
-                    <span>5h：{previewAccounts(bucket.fiveHourAccounts)}</span>
-                    <span>周：{previewAccounts(bucket.weeklyAccounts)}</span>
-                    {isExpanded ? <span className="bucket-full-list">{accounts.join('、') || '-'}</span> : null}
-                  </td>
-                  <td>
-                    <button
-                      className="icon-button small-icon-button"
-                      title={isExpanded ? '收起账号列表' : '展开账号列表'}
-                      onClick={() => setExpandedBucket(isExpanded ? null : bucket.bucket)}
-                    >
-                      {isExpanded ? <ChevronUp size={16} aria-hidden="true" /> : <ChevronDown size={16} aria-hidden="true" />}
-                    </button>
-                  </td>
-                </tr>
-              );
-            })
-          )}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function RefreshTimesPage({ latest }: { latest: LatestPayload }) {
-  const [search, setSearch] = useState('');
-  const [mode, setMode] = useState<BucketMode>('all');
-  const [sort, setSort] = useState<BucketSort>('time');
-
-  const visibleBuckets = useMemo(
-    () => filterRefreshBuckets(latest.refreshBuckets, search, mode, sort),
-    [latest.refreshBuckets, mode, search, sort],
-  );
-  const timelineBuckets = useMemo(() => buildTimelineBuckets(visibleBuckets), [visibleBuckets]);
-  const maxCount = Math.max(1, ...timelineBuckets.map(getBucketTotal));
-  const nonEmptyCount = visibleBuckets.length;
-  const totalAccounts = visibleBuckets.reduce((sum, bucket) => sum + getBucketTotal(bucket), 0);
-
-  return (
-    <section className="workspace-section refresh-page">
-      <div className="section-head detail-head">
-        <div>
-          <h2>刷新时间分布</h2>
-          <p>按本地时间 5 分钟桶聚合；adaptive 模式下可能包含缓存 reset 时间。</p>
-        </div>
-        <div className="detail-metrics">
-          <MetricPill label="有刷新桶" value={`${formatInteger(nonEmptyCount)} 个`} />
-          <MetricPill label="合计账号次" value={formatInteger(totalAccounts)} />
-          <MetricPill label="排序" value={sort === 'time' ? '按时间' : '按账号数'} />
-        </div>
-      </div>
-
-      <div className="filter-bar refresh-filter-bar">
-        <label className="search-box">
-          <Search size={16} aria-hidden="true" />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="搜索账号名过滤时间桶"
-            type="search"
-          />
-        </label>
-        <div className="segmented-control" aria-label="刷新窗口显示模式">
-          <button className={mode === 'all' ? 'active' : ''} onClick={() => setMode('all')}>
-            全部
-          </button>
-          <button className={mode === 'five-hour' ? 'active' : ''} onClick={() => setMode('five-hour')}>
-            只看 5h
-          </button>
-          <button className={mode === 'weekly' ? 'active' : ''} onClick={() => setMode('weekly')}>
-            只看周限
-          </button>
-        </div>
-        <div className="segmented-control" aria-label="刷新桶排序方式">
-          <button className={sort === 'time' ? 'active' : ''} onClick={() => setSort('time')}>
-            按时间
-          </button>
-          <button className={sort === 'count' ? 'active' : ''} onClick={() => setSort('count')}>
-            按账号数
-          </button>
-        </div>
-      </div>
-
-      <div className="timeline-panel">
-        <div className="timeline-head">
+      <section className="settings-modal" role="dialog" aria-modal="true" aria-label={title}>
+        <header className="settings-modal-head">
           <div>
-            <h3>24 小时时间轴</h3>
-            <p>颜色越深表示该 5 分钟桶内刷新账号越多。</p>
+            <p className="eyebrow">{eyebrow}</p>
+            <h2>{title}</h2>
           </div>
-          <span>{mode === 'all' ? '全部窗口' : mode === 'five-hour' ? '5h 窗口' : '周限窗口'}</span>
+          <button className="icon-button" type="button" title="关闭" onClick={onClose}>
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="settings-modal-body">{children}</div>
+      </section>
+    </div>
+  );
+}
+
+function SettingsModule({
+  targets,
+  onTargetsChanged,
+  onAlertSaved,
+  onCollectorSaved,
+  onPricingSaved,
+  alertSettings,
+  collectorSettings,
+  pricingProfile,
+}: {
+  targets: CpaTargetConfig[];
+  onTargetsChanged: () => Promise<void>;
+  onAlertSaved: (settings: EmailAlertSettings) => void;
+  onCollectorSaved: (settings: CollectorSettings) => void;
+  onPricingSaved: (profile: PricingProfile) => Promise<void> | void;
+  alertSettings: EmailAlertSettings | null;
+  collectorSettings: CollectorSettings | null;
+  pricingProfile: PricingProfile;
+}) {
+  const [activeDialog, setActiveDialog] = useState<SettingsDialog>(null);
+  const [cpaDialogMode, setCpaDialogMode] = useState<CpaDialogMode>('manage');
+  const [cpaDialogTargetId, setCpaDialogTargetId] = useState<string | null>(null);
+  const collectMinutes = collectorSecondsToMinutes(collectorSettings);
+  const autoCollectEnabled = collectorSettings?.autoCollectEnabled ?? true;
+  const collectConcurrency = collectorSettings?.collectConcurrency ?? DEFAULT_COLLECTOR_SETTINGS.collectConcurrency;
+  const manualConcurrency = collectorSettings?.collectManualConcurrency ?? DEFAULT_COLLECTOR_SETTINGS.collectManualConcurrency;
+  const requestsPerMinute = collectorSettings?.collectUsageMaxRequestsPerMinute ?? DEFAULT_COLLECTOR_SETTINGS.collectUsageMaxRequestsPerMinute;
+  const enabledTargets = targets.filter((target) => target.enabled).length;
+  const previewTargets = targets.slice(0, 3);
+  const emailIssues = getEmailConfigIssues(alertSettings);
+  const emailReady = alertSettings !== null && emailIssues.length === 0;
+  const emailStatusTone = alertSettings === null ? 'muted' : emailReady ? 'ok' : 'watch';
+  const emailStatusLabel = alertSettings === null ? '加载中' : emailReady ? '就绪' : '待配置';
+  const cpaStatusLabel = targets.length === 0 ? '未配置' : `${enabledTargets}/${targets.length} 启用`;
+  const pricingCustomized = isCustomizedPricingProfile(pricingProfile);
+  const pricingUnpricedWindows = countUnpricedPricingWindows(pricingProfile);
+  const configuredModuleCount = (enabledTargets > 0 ? 1 : 0) + (collectorSettings !== null ? 1 : 0) + (pricingCustomized ? 1 : 0) + (emailReady ? 1 : 0);
+  const openCpaDialog = (mode: CpaDialogMode, targetId: string | null = null) => {
+    setCpaDialogMode(mode);
+    setCpaDialogTargetId(targetId);
+    setActiveDialog('cpa');
+  };
+  const dialogMeta =
+    activeDialog === 'cpa'
+      ? { eyebrow: 'CPA', title: cpaDialogMode === 'create' ? '新增 CPA' : '管理 CPA' }
+      : activeDialog === 'collector'
+        ? { eyebrow: 'Collector', title: '采集与刷新' }
+        : activeDialog === 'pricing'
+          ? { eyebrow: 'Quota Pricing', title: '额度换算' }
+        : activeDialog === 'alert'
+          ? { eyebrow: 'Email Alert', title: '邮箱预警' }
+          : null;
+
+  return (
+    <div className="settings-module">
+      <header className="settings-heading">
+        <div>
+          <p className="eyebrow">Settings</p>
+          <h2>配置总览</h2>
         </div>
-        <div className="timeline-scroll">
-          <div className="timeline-grid">
-            {timelineBuckets.map((bucket) => (
-              <TimelineCell key={bucket.bucket} bucket={bucket} maxCount={maxCount} />
-            ))}
+        <StatusPill tone={configuredModuleCount === 4 ? 'ok' : 'watch'} label={`${configuredModuleCount}/4 模块已配置`} />
+      </header>
+
+      <div className="settings-sections">
+        <section className="content-card settings-config-section" aria-label="CPA 配置">
+          <div className="card-head settings-section-head">
+            <div>
+              <p className="eyebrow">CPA</p>
+              <h2>连接配置</h2>
+            </div>
+            <div className="settings-section-head-actions">
+              <StatusPill tone={enabledTargets > 0 ? 'ok' : 'watch'} label={cpaStatusLabel} />
+              <button className="button button-secondary" type="button" onClick={() => openCpaDialog('create')}>
+                <Plus size={16} aria-hidden="true" />
+                <span>新增 CPA</span>
+              </button>
+              <button className="button button-secondary" type="button" onClick={() => openCpaDialog('manage')}>
+                <Settings size={16} aria-hidden="true" />
+                <span>管理 CPA</span>
+              </button>
+            </div>
           </div>
-          <div className="timeline-ruler" aria-hidden="true">
-            {Array.from({ length: 25 }, (_, hour) => (
-              <span key={hour}>{hour.toString().padStart(2, '0')}:00</span>
-            ))}
+
+          <div className="settings-section-body">
+            <div className="settings-section-primary">
+              <strong>{enabledTargets} / {targets.length}</strong>
+              <span>启用 / 全部 CPA</span>
+            </div>
+
+            <div className={`settings-preview-list ${previewTargets.length <= 1 ? 'settings-preview-list-single' : ''}`}>
+              {previewTargets.length === 0 ? (
+                <div className="settings-preview-empty">还没有 CPA 配置</div>
+              ) : (
+                previewTargets.map((target) => (
+                  <button className="settings-preview-row settings-preview-row-button" key={target.id} type="button" onClick={() => openCpaDialog('manage', target.id)}>
+                    <span>
+                      <strong>{target.name}</strong>
+                      <em>{target.apiBase}</em>
+                    </span>
+                    <StatusPill tone={target.enabled ? 'ok' : 'muted'} label={target.enabled ? '启用' : '停用'} />
+                  </button>
+                ))
+              )}
+              {targets.length > previewTargets.length ? <div className="settings-preview-more">还有 {targets.length - previewTargets.length} 个 CPA</div> : null}
+            </div>
           </div>
-        </div>
+        </section>
+
+        <section className="content-card settings-config-section" aria-label="采集配置">
+          <div className="card-head settings-section-head">
+            <div>
+              <p className="eyebrow">Collector</p>
+              <h2>采集与刷新</h2>
+            </div>
+            <div className="settings-section-head-actions">
+              <StatusPill tone={autoCollectEnabled ? 'ok' : 'muted'} label={autoCollectEnabled ? '自动' : '暂停'} />
+              <button className="button button-secondary" type="button" onClick={() => setActiveDialog('collector')}>
+                <Settings size={16} aria-hidden="true" />
+                <span>编辑采集设置</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-section-body">
+            <div className="settings-section-primary">
+              <strong>{autoCollectEnabled ? `${collectMinutes} 分钟` : '已暂停'}</strong>
+              <span>后台自动采集间隔</span>
+            </div>
+
+            <div className="settings-preview-list settings-preview-metrics">
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{collectConcurrency} / {manualConcurrency}</strong>
+                  <em>后台 / 手动并发</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{requestsPerMinute} 次/分钟</strong>
+                  <em>Usage 请求预算</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>30 秒</strong>
+                  <em>本地界面固定刷新</em>
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="content-card settings-config-section" aria-label="额度换算配置">
+          <div className="card-head settings-section-head">
+            <div>
+              <p className="eyebrow">Quota Pricing</p>
+              <h2>额度换算</h2>
+            </div>
+            <div className="settings-section-head-actions">
+              <StatusPill tone={pricingCustomized ? 'ok' : 'muted'} label={pricingCustomized ? '自定义' : '参考值'} />
+              <button className="button button-secondary" type="button" onClick={() => setActiveDialog('pricing')}>
+                <Settings size={16} aria-hidden="true" />
+                <span>编辑额度换算</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-section-body">
+            <div className="settings-section-primary">
+              <strong>{pricingProfile.name}</strong>
+              <span>{pricingProfile.sourceLabel}</span>
+            </div>
+
+            <div className="settings-preview-list settings-preview-metrics pricing-preview-metrics">
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{pricingValueLabel(pricingProfile.plans.plus.fiveHourUsd)} / {pricingValueLabel(pricingProfile.plans.plus.weeklyUsd)}</strong>
+                  <em>Plus 5h / 周限</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{pricingValueLabel(pricingProfile.plans.team.fiveHourUsd)} / {pricingValueLabel(pricingProfile.plans.team.weeklyUsd)}</strong>
+                  <em>Team 5h / 周限</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{pricingUnpricedWindows} 个</strong>
+                  <em>未计价窗口</em>
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="content-card settings-config-section" aria-label="邮箱预警配置">
+          <div className="card-head settings-section-head">
+            <div>
+              <p className="eyebrow">Email Alert</p>
+              <h2>邮箱预警</h2>
+            </div>
+            <div className="settings-section-head-actions">
+              <StatusPill tone={emailStatusTone} label={emailStatusLabel} />
+              <button className="button button-secondary" type="button" onClick={() => setActiveDialog('alert')}>
+                <Settings size={16} aria-hidden="true" />
+                <span>编辑邮箱预警</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-section-body">
+            <div className="settings-section-primary">
+              <strong>{alertSettings?.enabled ? '开启' : '关闭'}</strong>
+              <span>{alertSettings?.recipients.length ?? 0} 个收件人</span>
+            </div>
+
+            <div className="settings-preview-list settings-preview-metrics">
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{getEmailToneLabel(alertSettings?.minTone)}</strong>
+                  <em>最低告警级别</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{alertSettings?.cooldownMinutes ?? 30} 分钟</strong>
+                  <em>同一 CPA 同类告警冷却</em>
+                </span>
+              </div>
+              <div className="settings-preview-row">
+                <span>
+                  <strong>{alertSettings?.hasSmtpPassword ? '已保存' : '未保存'}</strong>
+                  <em>SMTP 密码</em>
+                </span>
+              </div>
+              {!emailReady && alertSettings !== null ? <div className="settings-preview-more">{formatEmailIssueSummary(emailIssues)}</div> : null}
+            </div>
+          </div>
+        </section>
       </div>
 
-      <BucketDetailTable buckets={visibleBuckets} />
-    </section>
+      {dialogMeta ? (
+        <SettingsModal eyebrow={dialogMeta.eyebrow} title={dialogMeta.title} onClose={() => setActiveDialog(null)}>
+          {activeDialog === 'cpa' ? (
+            <CpaTargetsPanel targets={targets} onChanged={onTargetsChanged} initialMode={cpaDialogMode} initialTargetId={cpaDialogTargetId} />
+          ) : null}
+          {activeDialog === 'collector' ? <CollectorSettingsPanel settings={collectorSettings} onSaved={onCollectorSaved} /> : null}
+          {activeDialog === 'pricing' ? <PricingSettingsPanel profile={pricingProfile} onSaved={onPricingSaved} /> : null}
+          {activeDialog === 'alert' ? <AlertSettingsPanel onSaved={onAlertSaved} /> : null}
+        </SettingsModal>
+      ) : null}
+    </div>
   );
 }
 
 export function App() {
-  const [route, setRoute] = useState<AppRoute>('overview');
   const [booting, setBooting] = useState(true);
-  const [authenticated, setAuthenticated] = useState(false);
-  const [monitorKey, setMonitorKey] = useState('');
-  const [loginError, setLoginError] = useState<string | null>(null);
-  const [loginLoading, setLoginLoading] = useState(false);
+  const [configured, setConfigured] = useState(false);
+  const [targets, setTargets] = useState<CpaTargetConfig[]>([]);
   const [latest, setLatest] = useState<LatestPayload | null>(null);
-  const [selectedCpaId, setSelectedCpaId] = useState<string>('');
+  const [selectedCpaId, setSelectedCpaId] = useState('');
   const [loading, setLoading] = useState(false);
+  const [manualCollectPending, setManualCollectPending] = useState(false);
+  const [accountAction, setAccountAction] = useState<AccountActionState>(null);
   const [pageError, setPageError] = useState<string | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState(false);
-  const [pricingOpen, setPricingOpen] = useState(false);
-  const [pricingSaving, setPricingSaving] = useState(false);
-  const [pricingError, setPricingError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const syncRoute = () => {
-      const nextRoute = getRouteFromHash();
-      if (!nextRoute) {
-        window.location.hash = '#/overview';
-        setRoute('overview');
-        return;
-      }
-      setRoute(nextRoute);
-    };
-
-    syncRoute();
-    window.addEventListener('hashchange', syncRoute);
-    return () => window.removeEventListener('hashchange', syncRoute);
-  }, []);
+  const [activeModule, setActiveModule] = useState<AppModule>('overview');
+  const [alertSettings, setAlertSettings] = useState<EmailAlertSettings | null>(null);
+  const [collectorSettings, setCollectorSettings] = useState<CollectorSettings | null>(null);
+  const [pricingProfile, setPricingProfile] = useState<PricingProfile>(DEFAULT_PRICING_PROFILE);
+  const [alertLoading, setAlertLoading] = useState(false);
+  const selectedCpaIdRef = useRef('');
 
   const loadLatest = useCallback(async (cpaId?: string | null) => {
     setLoading(true);
     setPageError(null);
     try {
-      const payload = await monitorApi.latest(cpaId);
+      const payload = await monitorApi.latest(cpaId ?? undefined);
       setLatest(payload);
       setSelectedCpaId(payload.selectedCpaId);
+      setPricingProfile(payload.pricingProfile);
     } catch (error) {
-      if (error instanceof ClientApiError && error.status === 401) {
-        setAuthenticated(false);
-        setLatest(null);
-      } else {
-        setPageError(error instanceof Error ? error.message : '加载失败');
-      }
+      setPageError(error instanceof Error ? error.message : '加载监控数据失败');
     } finally {
       setLoading(false);
     }
   }, []);
 
+  const loadAppState = useCallback(async (loadData = true) => {
+    const state = await monitorApi.appState();
+    setConfigured(state.configured);
+    setTargets(state.targets);
+    setCollectorSettings(state.collector);
+    setAlertSettings(state.emailAlert);
+    setPricingProfile(state.pricingProfile);
+    setAlertLoading(false);
+    if (state.configured && loadData) {
+      await loadLatest(selectedCpaId || undefined);
+    }
+    if (!state.configured) {
+      setLatest(null);
+      setSelectedCpaId('');
+    }
+  }, [loadLatest, selectedCpaId]);
+
   useEffect(() => {
     let mounted = true;
-    monitorApi
-      .session()
-      .then((session) => {
+    (async () => {
+      try {
+        const state = await monitorApi.appState();
         if (!mounted) return;
-        setAuthenticated(session.authenticated);
-        if (session.authenticated) void loadLatest();
-      })
-      .catch(() => {
-        if (mounted) setAuthenticated(false);
-      })
-      .finally(() => {
+        setConfigured(state.configured);
+        setTargets(state.targets);
+        setCollectorSettings(state.collector);
+        setAlertSettings(state.emailAlert);
+        setPricingProfile(state.pricingProfile);
+        setAlertLoading(false);
+        if (state.configured) await loadLatest();
+      } catch (error) {
+        if (mounted) setPageError(error instanceof Error ? error.message : '启动客户端失败');
+      } finally {
         if (mounted) setBooting(false);
-      });
+      }
+    })();
     return () => {
       mounted = false;
     };
   }, [loadLatest]);
 
   useEffect(() => {
-    if (!authenticated || !autoRefresh) return undefined;
-    const timer = window.setInterval(() => {
-      void loadLatest(selectedCpaId);
-    }, PAGE_AUTO_REFRESH_MINUTES * 60 * 1000);
-    return () => window.clearInterval(timer);
-  }, [authenticated, autoRefresh, loadLatest, selectedCpaId]);
+    selectedCpaIdRef.current = selectedCpaId;
+  }, [selectedCpaId]);
 
   useEffect(() => {
-    if (!authenticated || latest?.collectorState.status !== 'collecting' || !selectedCpaId) return undefined;
+    let mounted = true;
+    let unlistenLatest: (() => void) | null = null;
+    let unlistenCollectorState: (() => void) | null = null;
+    let unlistenPaused: (() => void) | null = null;
+    void monitorApi.onLatestPayload((payload) => {
+      if (!mounted) return;
+      const currentSelectedCpaId = selectedCpaIdRef.current;
+      if (currentSelectedCpaId && payload.selectedCpaId !== currentSelectedCpaId) return;
+      setLatest(payload);
+      if (!currentSelectedCpaId) setSelectedCpaId(payload.selectedCpaId);
+      setPricingProfile(payload.pricingProfile);
+    }).then((unlisten) => {
+      unlistenLatest = unlisten;
+    });
+    void monitorApi.onCollectorState((payload) => {
+      if (!mounted) return;
+      setLatest((current) => {
+        if (!current || current.selectedCpaId !== payload.cpaId) return current;
+        return { ...current, collectorState: payload.collectorState };
+      });
+    }).then((unlisten) => {
+      unlistenCollectorState = unlisten;
+    });
+    void monitorApi.onCollectorPaused((payload) => {
+      if (!mounted) return;
+      if (payload.collector) {
+        setCollectorSettings(payload.collector);
+      } else {
+        setCollectorSettings((current) => {
+          const base = current ?? DEFAULT_COLLECTOR_SETTINGS;
+          return { ...base, autoCollectEnabled: !payload.paused };
+        });
+      }
+    }).then((unlisten) => {
+      unlistenPaused = unlisten;
+    });
+    return () => {
+      mounted = false;
+      unlistenLatest?.();
+      unlistenCollectorState?.();
+      unlistenPaused?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!configured) return;
     const timer = window.setInterval(() => {
-      void loadLatest(selectedCpaId);
-    }, 3000);
+      void loadLatest(selectedCpaId || undefined);
+    }, PAGE_AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [authenticated, latest?.collectorState.status, loadLatest, selectedCpaId]);
+  }, [configured, loadLatest, selectedCpaId]);
 
-  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!monitorKey.trim()) {
-      setLoginError('请输入 Monitor Key。');
-      return;
-    }
-    setLoginLoading(true);
-    setLoginError(null);
-    try {
-      await monitorApi.login(monitorKey.trim());
-      setAuthenticated(true);
-      setMonitorKey('');
-      await loadLatest();
-    } catch (error) {
-      setLoginError(error instanceof Error ? error.message : '登录失败');
-    } finally {
-      setLoginLoading(false);
-    }
+  const showTargetSelect = (latest?.targets.length ?? 0) > 1;
+  const collectProgress = getCollectorProgress(latest?.collectorState);
+  const collectButtonBusy = manualCollectPending || collectProgress.running;
+  const toolbarProgressActive = collectProgress.running || manualCollectPending;
+  const selectedTarget = latest?.targets.find((target) => target.id === selectedCpaId);
+  const selectedTargetName = selectedTarget?.name ?? selectedCpaId;
+  const toolbarStatusLabel = collectProgress.running
+    ? collectProgress.label
+    : manualCollectPending
+      ? '正在启动采集'
+      : getCollectorStatusLabel(latest?.collectorState.status ?? 'idle');
+  const toolbarStatusDetail = latest?.snapshot
+    ? `fresh ${formatInteger(latest.snapshot.collection.freshAccounts)}/${formatInteger(latest.snapshot.collection.enabledAccounts)} · ${latest.capacity.snapshotAgeMs === null ? formatTime(latest.snapshot.capturedAt) : formatAge(latest.capacity.snapshotAgeMs)}`
+    : loading
+      ? '加载中'
+      : '等待数据';
+  const emailIssues = useMemo(() => getEmailConfigIssues(alertSettings), [alertSettings]);
+  const alertSummary = {
+    enabled: Boolean(alertSettings?.enabled),
+    recipients: alertSettings?.recipients.length ?? 0,
+    ready: alertSettings !== null && emailIssues.length === 0,
+    loading: alertLoading || alertSettings === null,
   };
+  const handleAlertSaved = useCallback((settings: EmailAlertSettings) => {
+    setAlertSettings(settings);
+  }, []);
 
-  const handleLogout = async () => {
-    await monitorApi.logout();
-    setAuthenticated(false);
-    setLatest(null);
-  };
+  const handleCollectorSaved = useCallback((settings: CollectorSettings) => {
+    setCollectorSettings(settings);
+  }, []);
+
+  const handlePricingSaved = useCallback(async (profile: PricingProfile) => {
+    setPricingProfile(profile);
+    await loadLatest(selectedCpaId || undefined);
+  }, [loadLatest, selectedCpaId]);
+
+  const handleTargetsChanged = useCallback(async () => {
+    await loadAppState(true);
+  }, [loadAppState]);
+
+  const handleConfigured = useCallback(async () => {
+    await loadAppState(true);
+  }, [loadAppState]);
+
+  const applyLatestPayload = useCallback((payload: LatestPayload) => {
+    setLatest(payload);
+    setSelectedCpaId(payload.selectedCpaId);
+    setPricingProfile(payload.pricingProfile);
+  }, []);
 
   const handleSmartCollect = async () => {
     if (!selectedCpaId) return;
-    setLoading(true);
+    setManualCollectPending(true);
     setPageError(null);
     try {
       const payload = await monitorApi.refresh(selectedCpaId, { coverageMode: 'full-rate-limited' });
-      setLatest(payload);
-      setSelectedCpaId(payload.selectedCpaId);
+      applyLatestPayload(payload);
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : '智能采集启动失败');
+      setPageError(error instanceof Error ? error.message : '启动采集失败');
     } finally {
-      setLoading(false);
+      setManualCollectPending(false);
     }
   };
 
-  const handleSavePricing = async (profile: PricingProfile) => {
-    setPricingSaving(true);
-    setPricingError(null);
+  const handleAccountRefresh = async (row: AccountQuotaRow) => {
+    const rowActionKey = getAccountRowKey(row);
+    setAccountAction({ key: rowActionKey, action: 'refresh' });
+    setPageError(null);
     try {
-      await monitorApi.savePricing(profile);
-      await loadLatest(selectedCpaId);
-      setPricingOpen(false);
+      const payload = await monitorApi.refreshAccount(row.cpaId, row.accountKey);
+      applyLatestPayload(payload);
     } catch (error) {
-      setPricingError(error instanceof Error ? error.message : '保存价格表失败');
+      setPageError(error instanceof Error ? error.message : '刷新账号失败');
     } finally {
-      setPricingSaving(false);
+      setAccountAction((current) => (current?.key === rowActionKey ? null : current));
+    }
+  };
+
+  const handleAccountToggle = async (row: AccountQuotaRow, enabled: boolean) => {
+    const authFileName = getAccountAuthFileName(row);
+    const rowActionKey = getAccountRowKey(row);
+    setAccountAction({ key: rowActionKey, action: 'toggle' });
+    setPageError(null);
+    try {
+      const payload = await monitorApi.setAccountDisabled(row.cpaId, authFileName, !enabled);
+      applyLatestPayload(payload);
+    } catch (error) {
+      setPageError(error instanceof Error ? error.message : '修改凭证状态失败');
+    } finally {
+      setAccountAction((current) => (current?.key === rowActionKey ? null : current));
+    }
+  };
+
+  const handleAccountDelete = async (row: AccountQuotaRow) => {
+    const authFileName = getAccountAuthFileName(row);
+    if (!window.confirm(`确定删除凭证 ${authFileName} 吗？此操作会从 CPA 中移除该认证文件。`)) {
+      return;
+    }
+    const rowActionKey = getAccountRowKey(row);
+    setAccountAction({ key: rowActionKey, action: 'delete' });
+    setPageError(null);
+    try {
+      const payload = await monitorApi.deleteAccountCredential(row.cpaId, authFileName);
+      applyLatestPayload(payload);
+    } catch (error) {
+      setPageError(error instanceof Error ? error.message : '删除凭证失败');
+    } finally {
+      setAccountAction((current) => (current?.key === rowActionKey ? null : current));
     }
   };
 
@@ -1188,124 +2489,129 @@ export function App() {
       <main className="login-shell">
         <div className="login-panel loading-panel">
           <RefreshCw size={24} className="spin" aria-hidden="true" />
-          <strong>正在连接监控服务</strong>
+          <strong>正在启动本地客户端</strong>
         </div>
       </main>
     );
   }
 
-  if (!authenticated) {
-    return (
-      <LoginPanel
-        monitorKey={monitorKey}
-        error={loginError}
-        loading={loginLoading}
-        onChange={setMonitorKey}
-        onSubmit={handleLogin}
-      />
-    );
+  if (!configured) {
+    return <TargetSetupPanel onConfigured={handleConfigured} />;
   }
 
-  const pricingProfile = latest?.pricingProfile ?? DEFAULT_PRICING_PROFILE;
-  const selectedTarget = latest?.targets.find((target) => target.id === selectedCpaId);
-
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="topbar-main">
-          <div>
-            <p className="eyebrow">CPA Codex Account Pool</p>
-            <h1>额度监控</h1>
-            <div className="connection-line">
-              <Database size={15} aria-hidden="true" />
-              <span>{selectedTarget?.apiBase ?? '-'}</span>
-              <span className="dot-separator">/</span>
-              <span>上次采集 {formatTime(latest?.snapshot?.capturedAt)}</span>
-              <span className="dot-separator">/</span>
-              <span>{pricingProfile.sourceLabel}</span>
-            </div>
-          </div>
-          <PageNav route={route} />
-        </div>
-
-        <div className="actions topbar-actions">
-          <select
-            className="select target-select"
-            value={selectedCpaId}
-            onChange={(event) => void loadLatest(event.target.value)}
-            aria-label="选择 CPA"
-          >
-            {(latest?.targets ?? []).map((target) => (
-              <option key={target.id} value={target.id}>
-                {target.name}
-              </option>
+    <main className="monitor-shell">
+      <div className="app-layout">
+        <aside className="app-sidebar">
+          <nav className="module-nav" aria-label="模块">
+            {MODULES.map((module) => (
+              <button
+                key={module.id}
+                className={`module-nav-item ${activeModule === module.id ? 'module-nav-item-active' : ''}`}
+                type="button"
+                onClick={() => setActiveModule(module.id)}
+              >
+                {module.icon}
+                <span>{module.label}</span>
+              </button>
             ))}
-          </select>
-          <button
-            className="button button-primary action-with-note"
-            title="对当前 CPA 的启用账号按限速错峰补齐 usage，不集中请求全部账号。"
-            onClick={() => void handleSmartCollect()}
-            disabled={loading}
-          >
-            <span className="action-main">
-              <RefreshCw size={16} className={loading ? 'spin' : undefined} aria-hidden="true" />
-              <span>{loading ? '采集中' : '智能采集'}</span>
-            </span>
-            <span className="action-note">全池错峰补齐</span>
-          </button>
-          <label className="switch action-with-note" title={`每 ${PAGE_AUTO_REFRESH_MINUTES} 分钟刷新页面展示数据，不触发账号 usage 采集`}>
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(event) => setAutoRefresh(event.target.checked)}
-            />
-            <span className="switch-track">
-              {autoRefresh ? <Play size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}
-            </span>
-            <span className="action-text">
-              <span>页面自动刷新</span>
-              <span className="action-note">不请求 usage</span>
-            </span>
-          </label>
-          <button className="icon-button" title="价格表配置" onClick={() => setPricingOpen((value) => !value)}>
-            <Settings size={17} aria-hidden="true" />
-          </button>
-          <button className="icon-button" title="退出监控服务" onClick={() => void handleLogout()}>
-            <KeyRound size={17} aria-hidden="true" />
-          </button>
-        </div>
-      </header>
+          </nav>
 
-      {pageError ? (
-        <div className="page-alert" role="alert">
-          <AlertTriangle size={18} aria-hidden="true" />
-          <span>{pageError}</span>
-        </div>
-      ) : null}
+        </aside>
 
-      {pricingOpen ? (
-        <PricingPanel
-          key={pricingProfile.updatedAt}
-          profile={pricingProfile}
-          saving={pricingSaving}
-          error={pricingError}
-          onClose={() => setPricingOpen(false)}
-          onSave={handleSavePricing}
-        />
-      ) : null}
+        <section className="app-main">
+          <header className="app-toolbar">
+            <div className="toolbar-cpa">
+              <span>当前 CPA</span>
+              {showTargetSelect ? (
+                <label className="target-select" title="选择 CPA">
+                  <span className="sr-only">CPA</span>
+                  <select value={selectedCpaId} onChange={(event) => void loadLatest(event.target.value)} disabled={loading}>
+                    {(latest?.targets ?? []).map((target) => (
+                      <option key={target.id} value={target.id}>
+                        {target.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <strong>{selectedTargetName || '未选择'}</strong>
+              )}
+            </div>
 
-      {latest ? (
-        <>
-          {route === 'overview' ? <OverviewPage latest={latest} /> : null}
-          {route === 'accounts' ? <AccountsPage latest={latest} /> : null}
-          {route === 'refresh-times' ? <RefreshTimesPage latest={latest} /> : null}
-        </>
-      ) : (
-        <section className="workspace-section empty-state">
-          <RefreshCw size={22} className={loading ? 'spin' : undefined} aria-hidden="true" />
-          <strong>{loading ? '正在加载数据' : '暂无采集数据'}</strong>
+            <div className={`toolbar-collector ${toolbarProgressActive ? 'toolbar-collector-active' : ''}`} role="status" aria-live="polite">
+              <div className="toolbar-collector-copy">
+                <span>{toolbarStatusLabel}</span>
+                <em>{toolbarStatusDetail}</em>
+              </div>
+              <div className="collect-progress-track" aria-hidden="true">
+                <i
+                  className={collectProgress.percent === null && toolbarProgressActive ? 'collect-progress-bar collect-progress-bar-pending' : 'collect-progress-bar'}
+                  style={collectProgress.percent === null ? { width: toolbarProgressActive ? undefined : '0%' } : { width: `${collectProgress.percent}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="toolbar-actions">
+              <button className="button button-primary" type="button" onClick={() => void handleSmartCollect()} disabled={collectButtonBusy || !selectedCpaId}>
+                <RefreshCw size={16} className={collectButtonBusy ? 'spin' : undefined} aria-hidden="true" />
+                <span>{collectProgress.running ? '采集中' : manualCollectPending ? '启动中' : '立即采集'}</span>
+              </button>
+            </div>
+          </header>
+
+          {pageError ? (
+            <div className="page-alert" role="alert">
+              <AlertTriangle size={18} aria-hidden="true" />
+              <span>{pageError}</span>
+            </div>
+          ) : null}
+
+          <div className="module-content">
+            {latest ? (
+              <>
+                {activeModule === 'overview' ? (
+                  <OverviewModule
+                    latest={latest}
+                    alertSummary={alertSummary}
+                    emailIssues={emailIssues}
+                    onOpenSettings={() => setActiveModule('settings')}
+                  />
+                ) : null}
+                {activeModule === 'accounts' ? (
+                  <AccountDetailsModule
+                    accounts={latest.accounts}
+                    accountAction={accountAction}
+                    refreshDisabled={collectButtonBusy}
+                    onRefreshAccount={handleAccountRefresh}
+                    onToggleAccount={handleAccountToggle}
+                    onDeleteAccount={handleAccountDelete}
+                  />
+                ) : null}
+                {activeModule === 'settings' ? (
+                  <SettingsModule
+                    targets={targets}
+                    onTargetsChanged={handleTargetsChanged}
+                    onAlertSaved={handleAlertSaved}
+                    onCollectorSaved={handleCollectorSaved}
+                    onPricingSaved={handlePricingSaved}
+                    alertSettings={alertSettings}
+                    collectorSettings={collectorSettings}
+                    pricingProfile={pricingProfile}
+                  />
+                ) : null}
+              </>
+            ) : (
+              <section className="content-card empty-monitor">
+                <RefreshCw size={22} className={loading ? 'spin' : undefined} aria-hidden="true" />
+                <strong>{loading ? '正在加载数据' : '暂无监控数据'}</strong>
+              </section>
+            )}
+          </div>
         </section>
-      )}
+      </div>
     </main>
   );
 }
+
+export default App;

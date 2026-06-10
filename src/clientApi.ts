@@ -1,89 +1,146 @@
-import type { LatestPayload, PricingProfile, SessionPayload } from './shared/domain';
-
-type RefreshCoverageMode = 'auto' | 'full-rate-limited';
+import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { CollectorState, LatestPayload, PricingProfile } from './shared/domain';
 
 interface RefreshOptions {
   all?: boolean;
-  coverageMode?: RefreshCoverageMode;
+  coverageMode?: 'auto' | 'full-rate-limited';
   forceFull?: boolean;
+}
+
+export interface CpaTargetConfig {
+  id: string;
+  name: string;
+  apiBase: string;
+  enabled: boolean;
+  hasManagementKey: boolean;
+}
+
+export interface SaveTargetInput {
+  id?: string | null;
+  name: string;
+  apiBase: string;
+  enabled: boolean;
+  managementKey?: string | null;
+}
+
+export interface TestTargetConnectionResult {
+  ok: boolean;
+  totalAuthFiles: number;
+  codexAuthFiles: number;
+}
+
+export interface EmailAlertSettings {
+  enabled: boolean;
+  recipients: string[];
+  minTone: 'watch' | 'warn' | 'critical';
+  accountIssueThreshold: number;
+  cooldownMinutes: number;
+  softIssueCooldownMinutes: number;
+  timeoutSeconds: number;
+  maxMessageChars: number;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUsername: string;
+  smtpFrom: string;
+  hasSmtpPassword: boolean;
+}
+
+export interface SaveEmailAlertSettings extends EmailAlertSettings {
+  smtpPassword?: string;
+}
+
+export interface CollectorSettings {
+  autoCollectEnabled: boolean;
+  collectUsageTickSeconds: number;
+  collectUsageMaxRequestsPerMinute: number;
+  collectUsageMode: string;
+  collectConcurrency: number;
+  collectManualConcurrency: number;
+}
+
+export interface SaveCollectorSettings {
+  autoCollectEnabled: boolean;
+  collectUsageTickSeconds?: number;
+  collectUsageTickMinutes?: number;
+  collectUsageMaxRequestsPerMinute?: number;
+  collectConcurrency?: number;
+  collectManualConcurrency?: number;
+}
+
+export interface AppStatePayload {
+  configured: boolean;
+  targets: CpaTargetConfig[];
+  paused: boolean;
+  collector: CollectorSettings;
+  emailAlert: EmailAlertSettings;
+  pricingProfile: PricingProfile;
+}
+
+export interface CollectorPausedPayload {
+  paused: boolean;
+  collector?: CollectorSettings;
 }
 
 export class ClientApiError extends Error {
   status: number;
 
-  constructor(status: number, message: string) {
+  constructor(message: string, status = 500) {
     super(message);
     this.name = 'ClientApiError';
     this.status = status;
   }
 }
 
-async function readPayload(response: Response): Promise<unknown> {
-  const text = await response.text();
-  if (!text.trim()) return null;
+async function desktopInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw new ClientApiError(error instanceof Error ? error.message : String(error || 'Request failed'));
   }
 }
 
-function getMessage(payload: unknown, fallback: string): string {
-  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-    const record = payload as Record<string, unknown>;
-    if (typeof record.error === 'string') return record.error;
-    if (typeof record.message === 'string') return record.message;
-  }
-  return typeof payload === 'string' && payload ? payload : fallback;
+function isTauriRuntime(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/quota-monitor-api${path}`, {
-    ...init,
-    credentials: 'include',
-    headers: {
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(init.headers ?? {}),
-    },
-  });
-  const payload = await readPayload(response);
-  if (!response.ok) {
-    throw new ClientApiError(response.status, getMessage(payload, response.statusText || 'Request failed'));
-  }
-  return payload as T;
+function safeListen<T>(eventName: string, handler: (payload: T) => void): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<T>(eventName, (event) => handler(event.payload));
 }
 
 export const monitorApi = {
-  session: () => apiFetch<SessionPayload & { targets?: LatestPayload['targets'] }>('/session'),
-  login: (monitorKey: string) =>
-    apiFetch<SessionPayload>('/login', {
-      method: 'POST',
-      body: JSON.stringify({ monitorKey }),
-    }),
-  logout: () =>
-    apiFetch<SessionPayload>('/logout', {
-      method: 'POST',
-    }),
-  latest: (cpaId?: string | null) =>
-    apiFetch<LatestPayload>(`/latest${cpaId ? `?cpaId=${encodeURIComponent(cpaId)}` : ''}`),
-  refresh: (cpaId: string, options: RefreshOptions = {}) =>
-    apiFetch<LatestPayload>(`/refresh${cpaId ? `?cpaId=${encodeURIComponent(cpaId)}` : ''}`, {
-      method: 'POST',
-      body: JSON.stringify(
-        options.all
-          ? { all: true, coverageMode: options.coverageMode ?? 'auto', forceFull: options.forceFull }
-          : { cpaId, coverageMode: options.coverageMode ?? 'auto', forceFull: options.forceFull },
-      ),
-    }),
-  clearHistory: (cpaId: string) =>
-    apiFetch<{ ok: boolean }>(`/history?cpaId=${encodeURIComponent(cpaId)}`, {
-      method: 'DELETE',
-    }),
-  pricing: () => apiFetch<PricingProfile>('/pricing'),
-  savePricing: (profile: PricingProfile) =>
-    apiFetch<PricingProfile>('/pricing', {
-      method: 'PUT',
-      body: JSON.stringify(profile),
-    }),
-  exportUrl: (cpaId: string) => `/quota-monitor-api/export?cpaId=${encodeURIComponent(cpaId)}`,
+  appState: () => desktopInvoke<AppStatePayload>('get_app_state'),
+  listTargets: () => desktopInvoke<CpaTargetConfig[]>('list_targets'),
+  saveTarget: (target: SaveTargetInput) => desktopInvoke<CpaTargetConfig>('save_target', { target }),
+  deleteTarget: (targetId: string) => desktopInvoke<{ ok: boolean }>('delete_target', { targetId }),
+  testTargetConnection: (target: SaveTargetInput) =>
+    desktopInvoke<TestTargetConnectionResult>('test_target_connection', { target }),
+  latest: (cpaId?: string | null) => desktopInvoke<LatestPayload>('get_latest', { cpaId: cpaId ?? null }),
+  refresh: (cpaId: string, _options: RefreshOptions = {}) => desktopInvoke<LatestPayload>('refresh_target', { cpaId }),
+  refreshAccount: (cpaId: string, accountKey: string) =>
+    desktopInvoke<LatestPayload>('refresh_account', { cpaId, accountKey }),
+  setAccountDisabled: (cpaId: string, authFileName: string, disabled: boolean) =>
+    desktopInvoke<LatestPayload>('set_account_disabled', { cpaId, authFileName, disabled }),
+  deleteAccountCredential: (cpaId: string, authFileName: string) =>
+    desktopInvoke<LatestPayload>('delete_account_credential', { cpaId, authFileName }),
+  clearHistory: (cpaId: string) => desktopInvoke<{ ok: boolean }>('clear_history', { cpaId }),
+  pricing: () => desktopInvoke<PricingProfile>('get_pricing'),
+  savePricing: (profile: PricingProfile) => desktopInvoke<PricingProfile>('save_pricing', { profile }),
+  alertSettings: () => desktopInvoke<EmailAlertSettings>('get_alert_settings'),
+  saveAlertSettings: (settings: SaveEmailAlertSettings) =>
+    desktopInvoke<EmailAlertSettings>('save_alert_settings', { settings }),
+  saveCollectorSettings: (settings: SaveCollectorSettings) =>
+    desktopInvoke<CollectorSettings>('save_collector_settings', { settings }),
+  sendTestEmail: (settings: SaveEmailAlertSettings) => desktopInvoke<{ ok: boolean }>('send_test_email', { settings }),
+  exportSnapshot: (cpaId: string) => desktopInvoke<LatestPayload & { exportedAt: number }>('export_snapshot', { cpaId }),
+  pauseCollector: () => desktopInvoke<CollectorPausedPayload>('pause_collector'),
+  resumeCollector: () => desktopInvoke<CollectorPausedPayload>('resume_collector'),
+  onLatestPayload: (handler: (payload: LatestPayload) => void): Promise<UnlistenFn> =>
+    safeListen<LatestPayload>('latest-payload', handler),
+  onCollectorState: (handler: (payload: { cpaId: string; collectorState: CollectorState }) => void): Promise<UnlistenFn> =>
+    safeListen<{ cpaId: string; collectorState: CollectorState }>('collector-state', handler),
+  onCollectorPaused: (handler: (payload: CollectorPausedPayload) => void): Promise<UnlistenFn> =>
+    safeListen<CollectorPausedPayload>('collector-paused', handler),
 };

@@ -1,0 +1,31 @@
+[package]
+name = "neo-quota-monitor"
+version = "0.1.0"
+description = "NeoQuota Monitor desktop client"
+authors = ["NeoQuota Monitor"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "neo_quota_monitor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+keyring = "3"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
