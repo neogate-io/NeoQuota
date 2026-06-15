@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "NeoQuotaMonitor",
+  "productName": "NeoQuota",
   "version": "0.1.0",
-  "identifier": "com.neoquotamonitor.desktop",
+  "identifier": "com.neoquota.desktop",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "NeoQuotaMonitor",
+        "title": "NeoQuota",
         "width": 1280,
         "height": 860,
         "minWidth": 960,

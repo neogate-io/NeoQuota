@@ -481,8 +481,8 @@ impl AppService {
         send_email(
             &config,
             &password,
-            "[NeoQuota Monitor] 邮箱告警测试",
-            "NeoQuota Monitor 邮箱告警配置可用。",
+            "[NeoQuota] 邮箱告警测试",
+            "NeoQuota 邮箱告警配置可用。",
         )?;
         Ok(json!({ "ok": true }))
     }
@@ -871,6 +871,11 @@ impl AppService {
             .into_iter()
             .filter(quota::is_codex_file)
             .collect();
+        let previous_rows = self
+            .storage
+            .latest_snapshot(&target.id)?
+            .map(|snapshot| snapshot.rows)
+            .unwrap_or_default();
         let total = codex_files.len();
         self.patch_progress(&target.id, 0, total);
         let mut rows = vec![None; codex_files.len()];
@@ -879,6 +884,19 @@ impl AppService {
         let collect_concurrency = collect_concurrency(manual, &config.collector);
         let requests_per_minute = collect_requests_per_minute(manual, &config.collector);
         for (index, file) in codex_files.iter().cloned().enumerate() {
+            if !should_enqueue_usage_job(&file) {
+                rows[index] = Some(build_paused_row_from_cached_snapshot(
+                    &target,
+                    &file,
+                    &config.pricing_profile,
+                    now_ms(),
+                    &previous_rows,
+                ));
+                completed += 1;
+                self.patch_progress(&target.id, completed, total);
+                continue;
+            }
+
             let account_key = quota::resolve_codex_account_key(&file);
             if let Some(cooldown) =
                 self.storage
@@ -1516,6 +1534,67 @@ fn row_matches_auth_file(row: &Value, auth_file_name: &str) -> bool {
         .any(|candidate| candidate == auth_file_name)
 }
 
+fn should_enqueue_usage_job(file: &Value) -> bool {
+    !quota::is_disabled_auth_file(file)
+}
+
+fn build_paused_row_from_cached_snapshot(
+    target: &CpaTargetConfig,
+    file: &Value,
+    pricing_profile: &Value,
+    now_ms: i64,
+    previous_rows: &[Value],
+) -> Value {
+    let mut row = quota::build_codex_quota_row(target, file, None, pricing_profile, now_ms, None);
+    if let Some(previous) = find_matching_snapshot_row(&row, previous_rows) {
+        copy_cached_quota_windows(&mut row, previous, now_ms);
+    }
+    row
+}
+
+fn find_matching_snapshot_row<'a>(row: &Value, previous_rows: &'a [Value]) -> Option<&'a Value> {
+    let candidates = row_identity_values(row);
+    previous_rows.iter().find(|previous| {
+        candidates
+            .iter()
+            .any(|candidate| row_matches_auth_file(previous, candidate))
+    })
+}
+
+fn copy_cached_quota_windows(row: &mut Value, previous: &Value, now_ms: i64) {
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    let mut copied_window = false;
+    for field in ["fiveHour", "weekly"] {
+        if let Some(window) = previous.get(field).filter(|window| !window.is_null()) {
+            object.insert(field.to_string(), window.clone());
+            copied_window = true;
+        }
+    }
+    if !copied_window {
+        return;
+    }
+    if let Some(sampled_at) = previous.get("quotaSampledAt").and_then(Value::as_i64) {
+        object.insert("quotaSampledAt".to_string(), json!(sampled_at));
+        object.insert(
+            "quotaAgeMs".to_string(),
+            json!((now_ms - sampled_at).max(0)),
+        );
+    }
+    if let Some(header_source) = previous
+        .get("requestHeaderSource")
+        .filter(|value| !value.is_null())
+    {
+        object.insert("requestHeaderSource".to_string(), header_source.clone());
+    }
+    object.insert("status".to_string(), json!("paused"));
+    object.insert("disabled".to_string(), json!(true));
+    object.insert("quotaSource".to_string(), json!("paused"));
+    object.insert("error".to_string(), Value::Null);
+    object.insert("backoffUntil".to_string(), Value::Null);
+}
+
 fn row_error_for_summary(row: &Value) -> Option<String> {
     if row["disabled"].as_bool().unwrap_or(false) {
         return None;
@@ -1864,7 +1943,50 @@ fn sync_secret_flags(config: &mut AppConfig) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
     use tempfile::tempdir;
+
+    fn serve_once(
+        expected_request_prefix: &'static str,
+        response_status: u16,
+        response_body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("mock server address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0u8; 8192];
+            let size = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(
+                request.starts_with(expected_request_prefix),
+                "unexpected request: {request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer secret"),
+                "missing bearer auth header: {request}"
+            );
+            let reason = if response_status == 200 {
+                "OK"
+            } else {
+                "Error"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {response_status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write response");
+        });
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn sanitizes_target_ids() {
@@ -1943,6 +2065,178 @@ mod tests {
         assert_eq!(summary.soft, 0);
         assert_eq!(summary.severe, 0);
         assert_eq!(account_issue_count(&payload), 0);
+    }
+
+    #[test]
+    fn disabled_auth_files_are_not_enqueued_for_full_usage_collection() {
+        let paused = json!({
+            "provider": "codex",
+            "name": "paused.json",
+            "disabled": true,
+            "auth_index": "9"
+        });
+        let active = json!({
+            "provider": "codex",
+            "name": "active.json",
+            "disabled": false,
+            "auth_index": "10"
+        });
+
+        assert!(!should_enqueue_usage_job(&paused));
+        assert!(should_enqueue_usage_job(&active));
+    }
+
+    #[test]
+    fn paused_row_reuses_cached_reset_windows_from_previous_snapshot() {
+        let target = CpaTargetConfig {
+            id: "main".to_string(),
+            name: "Main CPA".to_string(),
+            api_base: "http://127.0.0.1:8398".to_string(),
+            enabled: true,
+            has_management_key: true,
+        };
+        let now = 2_000_000;
+        let sampled_at = now - 300_000;
+        let file = json!({
+            "provider": "codex",
+            "name": "paused-plus.json",
+            "id": "auth-paused",
+            "auth_index": "2",
+            "disabled": true,
+            "plan_type": "plus"
+        });
+        let previous = json!({
+            "cpaId": "main",
+            "name": "paused-plus.json",
+            "authFileName": "paused-plus.json",
+            "authId": "auth-paused",
+            "accountKey": "plus:acct_paused",
+            "authIndex": "2",
+            "accountId": "acct_paused",
+            "disabled": true,
+            "status": "paused",
+            "quotaSource": "paused",
+            "quotaSampledAt": sampled_at,
+            "requestHeaderSource": "cpa-metadata",
+            "fiveHour": {
+                "usedPercent": 52.0,
+                "remainingUsd": 9.0,
+                "remainingPoints": 4.5,
+                "fullUsd": 18.75,
+                "resetAtMs": now + 60_000
+            },
+            "weekly": {
+                "usedPercent": 13.0,
+                "remainingUsd": 80.0,
+                "remainingPoints": 40.0,
+                "fullUsd": 100.0,
+                "resetAtMs": now + 600_000
+            },
+            "error": "old ignored error",
+            "backoffUntil": now + 10_000
+        });
+
+        let row =
+            build_paused_row_from_cached_snapshot(&target, &file, &json!({}), now, &[previous]);
+
+        assert_eq!(row["disabled"], true);
+        assert_eq!(row["status"], "paused");
+        assert_eq!(row["quotaSource"], "paused");
+        assert_eq!(row["fiveHour"]["resetAtMs"], now + 60_000);
+        assert_eq!(row["weekly"]["resetAtMs"], now + 600_000);
+        assert_eq!(row["quotaSampledAt"], sampled_at);
+        assert_eq!(row["quotaAgeMs"], now - sampled_at);
+        assert_eq!(row["requestHeaderSource"], "cpa-metadata");
+        assert!(row["error"].is_null());
+        assert!(row["backoffUntil"].is_null());
+    }
+
+    #[test]
+    fn paused_row_without_cached_windows_stays_empty_and_out_of_error_summary() {
+        let target = CpaTargetConfig {
+            id: "main".to_string(),
+            name: "Main CPA".to_string(),
+            api_base: "http://127.0.0.1:8398".to_string(),
+            enabled: true,
+            has_management_key: true,
+        };
+        let file = json!({
+            "provider": "codex",
+            "name": "paused-empty.json",
+            "auth_index": "3",
+            "disabled": true
+        });
+
+        let row = build_paused_row_from_cached_snapshot(&target, &file, &json!({}), 2_000_000, &[]);
+
+        assert_eq!(row["disabled"], true);
+        assert_eq!(row["status"], "paused");
+        assert_eq!(row["quotaSource"], "paused");
+        assert!(row["fiveHour"].is_null());
+        assert!(row["weekly"].is_null());
+        assert!(snapshot_error_summary(&[row]).is_none());
+    }
+
+    #[tokio::test]
+    async fn targeted_fetch_still_collects_disabled_auth_usage_windows() {
+        let (api_base, handle) = serve_once(
+            "POST /v0/management/api-call HTTP/1.1",
+            200,
+            r#"{
+                "status_code": 200,
+                "body": {
+                    "rate_limit": {
+                        "limit_reached": false,
+                        "allowed": true,
+                        "primary_window": {
+                            "limit_window_seconds": 18000,
+                            "used_percent": 20,
+                            "reset_after_seconds": 600
+                        },
+                        "secondary_window": {
+                            "limit_window_seconds": 604800,
+                            "used_percent": 40,
+                            "reset_after_seconds": 1200
+                        }
+                    }
+                }
+            }"#,
+        );
+        let target = CpaTargetConfig {
+            id: "main".to_string(),
+            name: "Main CPA".to_string(),
+            api_base,
+            enabled: true,
+            has_management_key: true,
+        };
+        let client = Arc::new(CpaClient::new(target.clone(), "secret".to_string(), 5).unwrap());
+        let file = json!({
+            "provider": "codex",
+            "name": "paused-refresh.json",
+            "auth_index": "paused-1",
+            "disabled": true,
+            "plan_type": "plus"
+        });
+
+        let result = AppService::fetch_codex_row(
+            client,
+            target,
+            file,
+            pricing::default_pricing_profile(),
+            Arc::new(UsageRateLimiter::new()),
+            60.0,
+        )
+        .await;
+        handle.join().unwrap();
+
+        assert_eq!(result.row["disabled"], true);
+        assert_eq!(result.row["status"], "paused");
+        assert_eq!(result.row["quotaSource"], "paused");
+        assert_eq!(result.row["fiveHour"]["usedPercent"], 20.0);
+        assert_eq!(result.row["weekly"]["usedPercent"], 40.0);
+        assert!(result.row["fiveHour"]["resetAtMs"].as_i64().is_some());
+        assert!(result.row["weekly"]["resetAtMs"].as_i64().is_some());
+        assert!(result.row["error"].is_null());
     }
 
     #[test]
@@ -2044,7 +2338,7 @@ mod tests {
             "smtpPort": 465,
             "smtpSecure": true,
             "smtpUsername": "ops@example.com",
-            "smtpFrom": "NeoQuota Monitor <ops@example.com>"
+            "smtpFrom": "NeoQuota <ops@example.com>"
         }))
         .unwrap();
 

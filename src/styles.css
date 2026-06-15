@@ -1011,6 +1011,11 @@ p {
   white-space: nowrap;
 }
 
+.accounts-table th:not(:first-child),
+.accounts-table td:not(:first-child) {
+  text-align: center;
+}
+
 .accounts-table tr:last-child td {
   border-bottom: 0;
 }
@@ -1157,7 +1162,7 @@ p {
   min-width: 0;
   display: grid;
   gap: 4px;
-  justify-items: start;
+  justify-items: center;
 }
 
 .source-cell small {
@@ -1445,6 +1450,77 @@ p {
   min-height: 0;
   overflow: auto;
   padding: 18px;
+}
+
+.account-delete-modal {
+  width: min(500px, 100%);
+  grid-template-rows: auto auto;
+}
+
+.account-delete-modal-head {
+  align-items: flex-start;
+}
+
+.account-delete-title {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.account-delete-title h2 {
+  margin: 0;
+}
+
+.account-delete-title p:not(.eyebrow) {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.account-delete-icon {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 36px;
+  border: 1px solid rgba(177, 69, 69, 0.24);
+  border-radius: 8px;
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.account-delete-modal-body {
+  display: grid;
+  gap: 14px;
+}
+
+.account-delete-summary {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.account-delete-summary span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.account-delete-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.account-delete-actions {
+  padding-top: 0;
 }
 
 .settings-panel {

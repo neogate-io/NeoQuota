@@ -232,7 +232,7 @@ pub fn run() {
             resume_collector
         ])
         .build(tauri::generate_context!())
-        .expect("error while building NeoQuotaMonitor desktop app")
+        .expect("error while building NeoQuota desktop app")
         .run(|app, event| {
             if let RunEvent::Reopen { .. } = event {
                 show_main_window(app);
@@ -256,7 +256,7 @@ fn setup_tray(app: &tauri::AppHandle, service: Arc<AppService>) -> tauri::Result
     let mut builder = TrayIconBuilder::with_id("main")
         .icon(tray_icon)
         .menu(&menu)
-        .tooltip("NeoQuota Monitor")
+        .tooltip("NeoQuota")
         .show_menu_on_left_click(true);
 
     #[cfg(target_os = "macos")]

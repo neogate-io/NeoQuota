@@ -557,12 +557,25 @@ function getAccountFiveHourResetMs(row: AccountQuotaRow): number | null {
   return typeof resetAtMs === 'number' && Number.isFinite(resetAtMs) ? resetAtMs : null;
 }
 
-function compareAccountsByFiveHourReset(left: AccountQuotaRow, right: AccountQuotaRow): number {
-  const leftResetAt = getAccountFiveHourResetMs(left);
-  const rightResetAt = getAccountFiveHourResetMs(right);
-  if (leftResetAt !== null && rightResetAt !== null && leftResetAt !== rightResetAt) return leftResetAt - rightResetAt;
-  if (leftResetAt !== null && rightResetAt === null) return -1;
-  if (leftResetAt === null && rightResetAt !== null) return 1;
+function getAccountWeeklyResetMs(row: AccountQuotaRow): number | null {
+  const resetAtMs = row.weekly?.resetAtMs;
+  return typeof resetAtMs === 'number' && Number.isFinite(resetAtMs) ? resetAtMs : null;
+}
+
+function compareNullableTime(left: number | null, right: number | null): number {
+  if (left !== null && right !== null && left !== right) return left - right;
+  if (left !== null && right === null) return -1;
+  if (left === null && right !== null) return 1;
+  return 0;
+}
+
+function compareAccountsForDisplay(left: AccountQuotaRow, right: AccountQuotaRow): number {
+  const enabledDelta = Number(left.disabled) - Number(right.disabled);
+  if (enabledDelta !== 0) return enabledDelta;
+  const fiveHourDelta = compareNullableTime(getAccountFiveHourResetMs(left), getAccountFiveHourResetMs(right));
+  if (fiveHourDelta !== 0) return fiveHourDelta;
+  const weeklyDelta = compareNullableTime(getAccountWeeklyResetMs(left), getAccountWeeklyResetMs(right));
+  if (weeklyDelta !== 0) return weeklyDelta;
   const nameDelta = ACCOUNT_ROW_COLLATOR.compare(left.name, right.name);
   if (nameDelta !== 0) return nameDelta;
   return ACCOUNT_ROW_COLLATOR.compare(left.accountKey, right.accountKey);
@@ -654,7 +667,7 @@ function TargetSetupPanel({ onConfigured }: { onConfigured: () => Promise<void> 
         <div className="login-mark">
           <ShieldCheck size={20} aria-hidden="true" />
         </div>
-        <p className="eyebrow">NeoQuota Monitor</p>
+        <p className="eyebrow">NeoQuota</p>
         <h1 id="setup-title">配置第一个 CPA</h1>
         <p className="login-copy">客户端会把 Management Key 保存到系统钥匙串，配置完成后由桌面后台直接采集账号池额度。</p>
 
@@ -940,7 +953,7 @@ function AccountDetailsModule({
         if (withFiveHourResetOnly && getAccountFiveHourResetMs(row) === null) return false;
         return true;
       })
-      .sort(compareAccountsByFiveHourReset);
+      .sort(compareAccountsForDisplay);
   }, [accounts, issueOnly, normalizedSearchText, planFilter, statusFilter, withFiveHourResetOnly]);
   const issueCount = useMemo(() => rows.filter(isIssueRow).length, [rows]);
   const caption = filtersActive
@@ -1734,7 +1747,7 @@ function AlertSettingsPanel({ onSaved }: { onSaved: (settings: EmailAlertSetting
 
               <label className="form-field field-wide">
                 <span>From</span>
-                <input value={settings.smtpFrom} onChange={(event) => updateSetting('smtpFrom', event.target.value)} placeholder="NeoQuota Monitor <monitor@example.com>" />
+                <input value={settings.smtpFrom} onChange={(event) => updateSetting('smtpFrom', event.target.value)} placeholder="NeoQuota <monitor@example.com>" />
               </label>
             </div>
           </fieldset>
@@ -1982,6 +1995,71 @@ function SettingsModal({
           </button>
         </header>
         <div className="settings-modal-body">{children}</div>
+      </section>
+    </div>
+  );
+}
+
+function AccountDeleteConfirmDialog({
+  row,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  row: AccountQuotaRow;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const authFileName = getAccountAuthFileName(row);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!busy && event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [busy, onCancel]);
+
+  return (
+    <div
+      className="settings-modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (!busy && event.currentTarget === event.target) onCancel();
+      }}
+    >
+      <section className="settings-modal account-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="account-delete-title" aria-describedby="account-delete-description">
+        <header className="settings-modal-head account-delete-modal-head">
+          <div className="account-delete-title">
+            <span className="account-delete-icon" aria-hidden="true">
+              <Trash2 size={18} />
+            </span>
+            <div>
+              <p className="eyebrow">Credential</p>
+              <h2 id="account-delete-title">删除凭证</h2>
+              <p id="account-delete-description">此操作会从 CPA 中移除该认证文件，确认后无法在本客户端撤销。</p>
+            </div>
+          </div>
+          <button className="icon-button" type="button" title="关闭" onClick={onCancel} disabled={busy}>
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="settings-modal-body account-delete-modal-body">
+          <div className="account-delete-summary">
+            <span>凭证名</span>
+            <strong title={authFileName}>{authFileName}</strong>
+          </div>
+          <div className="form-actions account-delete-actions">
+            <button className="button button-secondary" type="button" onClick={onCancel} disabled={busy}>
+              取消
+            </button>
+            <button className="button button-danger" type="button" onClick={onConfirm} disabled={busy}>
+              {busy ? <RefreshCw size={16} className="spin" aria-hidden="true" /> : <Trash2 size={16} aria-hidden="true" />}
+              <span>{busy ? '删除中' : '确认删除'}</span>
+            </button>
+          </div>
+        </div>
       </section>
     </div>
   );
@@ -2252,6 +2330,7 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [manualCollectPending, setManualCollectPending] = useState(false);
   const [accountAction, setAccountAction] = useState<AccountActionState>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<AccountQuotaRow | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
   const [activeModule, setActiveModule] = useState<AppModule>('overview');
   const [alertSettings, setAlertSettings] = useState<EmailAlertSettings | null>(null);
@@ -2467,22 +2546,33 @@ export function App() {
   };
 
   const handleAccountDelete = async (row: AccountQuotaRow) => {
+    setPageError(null);
+    setDeleteCandidate(row);
+  };
+
+  const confirmAccountDelete = async () => {
+    if (!deleteCandidate) return;
+    const row = deleteCandidate;
     const authFileName = getAccountAuthFileName(row);
-    if (!window.confirm(`确定删除凭证 ${authFileName} 吗？此操作会从 CPA 中移除该认证文件。`)) {
-      return;
-    }
     const rowActionKey = getAccountRowKey(row);
     setAccountAction({ key: rowActionKey, action: 'delete' });
     setPageError(null);
     try {
       const payload = await monitorApi.deleteAccountCredential(row.cpaId, authFileName);
       applyLatestPayload(payload);
+      setDeleteCandidate(null);
     } catch (error) {
+      setDeleteCandidate(null);
       setPageError(error instanceof Error ? error.message : '删除凭证失败');
     } finally {
       setAccountAction((current) => (current?.key === rowActionKey ? null : current));
     }
   };
+
+  const deleteDialogBusy =
+    deleteCandidate !== null &&
+    accountAction?.key === getAccountRowKey(deleteCandidate) &&
+    accountAction.action === 'delete';
 
   if (booting) {
     return (
@@ -2610,6 +2700,14 @@ export function App() {
           </div>
         </section>
       </div>
+      {deleteCandidate ? (
+        <AccountDeleteConfirmDialog
+          row={deleteCandidate}
+          busy={deleteDialogBusy}
+          onCancel={() => setDeleteCandidate(null)}
+          onConfirm={() => void confirmAccountDelete()}
+        />
+      ) : null}
     </main>
   );
 }

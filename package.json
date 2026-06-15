@@ -1,5 +1,5 @@
 {
-  "name": "neo-quota-monitor",
+  "name": "neo-quota",
   "private": true,
   "version": "0.1.0",
   "type": "module",

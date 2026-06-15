@@ -1,6 +1,6 @@
-# NeoQuota Monitor
+# NeoQuota
 
-NeoQuota Monitor 是一个用于 CPA Codex 账号池的本地桌面监控器。它通过 CPA Management API 采集账号额度和近期消耗，在本地展示容量、风险和账号明细，并可在容量紧张或账号异常时发送邮件告警。
+NeoQuota 是一个用于 CPA Codex 账号池的本地桌面监控器。它通过 CPA Management API 采集账号额度和近期消耗，在本地展示容量、风险和账号明细，并可在容量紧张或账号异常时发送邮件告警。
 
 当前项目只提供 Tauri 2 桌面客户端；Vite 仅作为 renderer 的开发入口，不提供独立 Web 监控页。项目不包含 CPA 服务端，也不接管账号登录态，需要使用者提供已运行的 CPA 服务、API Base 和 Management Key。
 
@@ -58,7 +58,7 @@ bun run desktop:build
 macOS 客户端在 macOS 本机编译：
 
 ```bash
-cd /path/to/NeoQuotaMonitor
+cd /path/to/NeoQuota
 bun install --frozen-lockfile
 bun run desktop:build
 ```
@@ -66,14 +66,14 @@ bun run desktop:build
 产物位置：
 
 ```text
-src-tauri/target.noindex/release/bundle/macos/NeoQuotaMonitor.app
-src-tauri/target.noindex/release/bundle/dmg/NeoQuotaMonitor_0.1.0_aarch64.dmg
+src-tauri/target.noindex/release/bundle/macos/NeoQuota.app
+src-tauri/target.noindex/release/bundle/dmg/NeoQuota_0.1.0_aarch64.dmg
 ```
 
 在 macOS 本机交叉编译 Windows x64 客户端时，首次需要安装 Windows target、`cargo-xwin` 和 NSIS：
 
 ```bash
-cd /path/to/NeoQuotaMonitor
+cd /path/to/NeoQuota
 bun install --frozen-lockfile
 
 bun scripts/with-rustup-path.mjs rustup target add x86_64-pc-windows-msvc
@@ -84,7 +84,7 @@ brew install makensis
 之后编译 Windows NSIS 安装包：
 
 ```bash
-cd /path/to/NeoQuotaMonitor
+cd /path/to/NeoQuota
 
 tmpbin="$(mktemp -d)"
 ln -sf /opt/homebrew/bin/makensis "$tmpbin/makensis.exe"
@@ -97,8 +97,8 @@ PATH="$tmpbin:$PATH" bun scripts/with-rustup-path.mjs node_modules/.bin/tauri bu
 产物位置：
 
 ```text
-src-tauri/target.noindex/x86_64-pc-windows-msvc/release/neo-quota-monitor.exe
-src-tauri/target.noindex/x86_64-pc-windows-msvc/release/bundle/nsis/NeoQuotaMonitor_0.1.0_x64-setup.exe
+src-tauri/target.noindex/x86_64-pc-windows-msvc/release/neo-quota.exe
+src-tauri/target.noindex/x86_64-pc-windows-msvc/release/bundle/nsis/NeoQuota_0.1.0_x64-setup.exe
 ```
 
 如果只需要 Windows 裸 exe，不需要安装包：

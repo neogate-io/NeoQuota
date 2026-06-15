@@ -3,10 +3,15 @@ use keyring::Entry;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-const SERVICE_NAME: &str = "NeoQuotaMonitor";
+const SERVICE_NAME: &str = "NeoQuota";
+const LEGACY_SERVICE_NAMES: &[&str] = &["NeoQuotaMonitor"];
 
 fn entry(name: &str) -> Result<Entry> {
-    Entry::new(SERVICE_NAME, name).context("无法打开系统钥匙串条目")
+    entry_for_service(SERVICE_NAME, name)
+}
+
+fn entry_for_service(service: &str, name: &str) -> Result<Entry> {
+    Entry::new(service, name).context("无法打开系统钥匙串条目")
 }
 
 pub fn target_key_name(target_id: &str) -> String {
@@ -44,12 +49,26 @@ pub fn set_secret(name: &str, secret: &str) -> Result<()> {
 }
 
 pub fn get_secret(name: &str) -> Result<Option<String>> {
-    match entry(name)?.get_password() {
+    if let Some(value) = get_secret_from_service(SERVICE_NAME, name)? {
+        return Ok(Some(value));
+    }
+
+    for service in LEGACY_SERVICE_NAMES {
+        if let Some(value) = get_secret_from_service(service, name)? {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+fn get_secret_from_service(service: &str, name: &str) -> Result<Option<String>> {
+    match entry_for_service(service, name)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => {
             #[cfg(target_os = "macos")]
             {
-                macos_security_get(name)
+                macos_security_get(service, name)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -61,23 +80,36 @@ pub fn get_secret(name: &str) -> Result<Option<String>> {
 }
 
 pub fn delete_secret(name: &str) -> Result<()> {
-    let result = match entry(name)?.delete_credential() {
+    delete_secret_from_service(SERVICE_NAME, name)?;
+    for service in LEGACY_SERVICE_NAMES {
+        delete_secret_from_service(service, name)?;
+    }
+    Ok(())
+}
+
+fn delete_secret_from_service(service: &str, name: &str) -> Result<()> {
+    let result = match entry_for_service(service, name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(error).context("删除系统钥匙串密钥失败"),
     };
     #[cfg(target_os = "macos")]
-    macos_security_delete(name)?;
+    macos_security_delete(service, name)?;
     result
 }
 
 #[cfg(target_os = "macos")]
 fn macos_security_set(name: &str, secret: &str) -> Result<()> {
+    macos_security_set_for_service(SERVICE_NAME, name, secret)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_security_set_for_service(service: &str, name: &str, secret: &str) -> Result<()> {
     let status = Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
             "-U",
             "-s",
-            SERVICE_NAME,
+            service,
             "-a",
             name,
             "-w",
@@ -93,16 +125,9 @@ fn macos_security_set(name: &str, secret: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_security_get(name: &str) -> Result<Option<String>> {
+fn macos_security_get(service: &str, name: &str) -> Result<Option<String>> {
     let output = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            SERVICE_NAME,
-            "-a",
-            name,
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", service, "-a", name, "-w"])
         .output()
         .context("调用 macOS security 读取钥匙串失败")?;
     if output.status.success() {
@@ -117,9 +142,9 @@ fn macos_security_get(name: &str) -> Result<Option<String>> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_security_delete(name: &str) -> Result<()> {
+fn macos_security_delete(service: &str, name: &str) -> Result<()> {
     let output = Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", SERVICE_NAME, "-a", name])
+        .args(["delete-generic-password", "-s", service, "-a", name])
         .output()
         .context("调用 macOS security 删除钥匙串密钥失败")?;
     if output.status.success()

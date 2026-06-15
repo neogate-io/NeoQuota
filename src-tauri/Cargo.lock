@@ -1985,7 +1985,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "neo-quota-monitor"
+name = "neo-quota"
 version = "0.1.0"
 dependencies = [
  "anyhow",
