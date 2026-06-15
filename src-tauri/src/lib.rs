@@ -14,9 +14,10 @@ use models::{SaveCollectorSettings, SaveEmailAlertSettings, SaveTargetRequest};
 use serde_json::Value;
 use service::AppService;
 use storage::Storage;
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
 use tauri::{
-    include_image, menu::MenuBuilder, tray::TrayIconBuilder, Emitter, Manager, RunEvent,
-    WindowEvent,
+    include_image, menu::MenuBuilder, tray::TrayIconBuilder, Emitter, Manager, WindowEvent,
 };
 
 #[tauri::command]
@@ -234,9 +235,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building NeoQuota desktop app")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
             if let RunEvent::Reopen { .. } = event {
                 show_main_window(app);
             }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
 
